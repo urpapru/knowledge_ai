@@ -299,9 +299,9 @@ with gr.Blocks(
                 with gr.Column():
                     gr.Markdown("### 📤 上传新文档")
                     file_upload = gr.File(
-                        label="选择文件（支持 .txt, .pdf, .md）",
+                        label="选择文件（支持 .txt, .pdf, .md,.docx）",
                         file_count="multiple",
-                        file_types=[".txt", ".pdf", ".md"],
+                        file_types=[".txt", ".pdf", ".md",".docx"],
                     )
                     upload_btn = gr.Button("📤 上传并添加到知识库", variant="primary")
                     upload_status = gr.Markdown()
