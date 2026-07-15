@@ -1,0 +1,15 @@
+1. 错误核心：contents is neither str nor list of str（内容既不是字符串，也不是字符串列表）。
+    1. 原因
+    - langchain_openai 的 OpenAIEmbeddings 在发送请求前，默认会自作聪明地用 tiktoken 把文本切成 Token ID（变成一堆整数数组），然后把这些整数发给 API（为了节省带宽和检查长度）
+    - 但是！阿里云 DashScope 的 OpenAI 兼容接口，只接受“原始字符串”或“字符串列表”，根本不支持接收 Token ID（整数数组）
+    - 当 DashScope 收到一堆整数时，它懵了，于是报错：“你传给我的 contents 既不是字符串也不是字符串列表啊！
+
+
+    2. 解决
+    embeddings = OpenAIEmbeddings(
+        model="text-embedding-v3",  # 也可以用最新的 text-embedding-v4
+        api_key=API_KEY,
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        check_embedding_ctx_length=False,  # 🔥 关键！禁止 LangChain 预分词，直接发送原始字符串
+        chunk_size=10,                     # 🔥 控制每次发送的文本块数量，防止单次请求超限
+    )

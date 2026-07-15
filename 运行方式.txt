@@ -1,0 +1,14 @@
+# 1. 安装依赖
+pip install -r requirements.txt
+
+# 2. 准备文档（把你的笔记、文档放进 docs/ 目录）
+mkdir -p docs
+# 复制你的 Markdown / PDF / TXT 文件到 docs/
+
+# 3. 配置 API Key
+echo "DASHSCOPE_API_KEY=sk-your-key-here" > .env
+
+# 4. 启动应用
+python app.py
+
+# 5. 浏览器打开 http://localhost:7860

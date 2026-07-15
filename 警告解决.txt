@@ -1,0 +1,10 @@
+1. LangChainDeprecationWarning: The class Chroma was deprecated... import as from langchain_chroma import Chroma
+    1. 原因
+     - LangChain 把 Chroma 向量数据库拆分到了独立的包里。虽然只是个警告，不影响运行，但强迫症看着难受。我们可以顺手把它解决掉
+    2. 解决
+     - 在终端安装新包 uv pip install -U langchain-chroma (一定要关闭正在运行的python 进程)
+     - 修改 rag_engine.py 的导入语句： 
+        - 旧的导入： from langchain_community.vectorstores import Chroma
+                    #或者
+                    from langchain.vectorstores import Chroma
+        - 新的导入： from langchain_chroma import Chroma
