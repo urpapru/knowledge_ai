@@ -5,6 +5,7 @@ Advanced RAG 引擎：负责文档加载、切分、混合检索、重排序和�
 import os
 import logging
 from pathlib import Path
+import hashlib
 
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 # from langchain_community.vectorstores import Chroma  # 旧的导入
@@ -336,3 +337,234 @@ class RAGEngine:
             }
         except:
             return {"状态": "⚠️ 索引状态异常"}
+        
+
+    def _generate_chunk_id(self, source: str, index: int) -> str:
+        """
+        为每个文档块生成唯一 ID
+        格式：source_hash + chunk_index
+        例如：a1b2c3_0, a1b2c3_1, a1b2c3_2
+        """
+        source_hash = hashlib.md5(source.encode()).hexdigest()[:8]
+        return f"{source_hash}_{index}"
+    
+
+    def list_documents(self) -> list[dict]:
+        """
+        列出知识库中所有已索引的文档（按文件名聚合）
+        返回：[{"filename": "xxx.pdf", "chunks": 5, "source": "/path/xxx.pdf"}, ...]
+        """
+        if not self.vectorstore:
+            return []
+        
+        try:
+            # 从 Chroma 获取所有 metadata
+            raw_data = self.vectorstore._collection.get(include=["metadatas"])
+            metadatas = raw_data["metadatas"]
+            
+            # 按 source 聚合统计
+            doc_stats = {}
+            for meta in metadatas:
+                source = meta.get("source", "未知")
+                filename = Path(source).name if source else "未知"
+                
+                if source not in doc_stats:
+                    doc_stats[source] = {
+                        "filename": filename,
+                        "source": source,
+                        "chunks": 0,
+                    }
+                doc_stats[source]["chunks"] += 1
+            
+            return list(doc_stats.values())
+        except Exception as e:
+            logger.error(f"❌ 列出文档失败: {e}")
+            return []
+        
+
+    def delete_document(self, source: str) -> dict:
+        """
+        从知识库中删除指定文档的所有文档块
+        source: 文档的完整路径或文件名
+        """
+        if not self.vectorstore:
+            return {"error": "向量库未初始化"}
+        
+        try:
+            filename = Path(source).name
+            
+            # Step 1: 从 Chroma 中删除（按 metadata 中的 source 匹配）
+            # 先查出所有匹配的 ID
+            results = self.vectorstore._collection.get(
+                where={"source": source},
+                include=[]
+            )
+            ids_to_delete = results["ids"]
+            
+            if not ids_to_delete:
+                # 尝试用文件名匹配
+                all_data = self.vectorstore._collection.get(include=["metadatas"])
+                ids_to_delete = [
+                    id_ for id_, meta in zip(all_data["ids"], all_data["metadatas"])
+                    if Path(meta.get("source", "")).name == filename
+                ]
+            
+            if not ids_to_delete:
+                return {"error": f"未找到文档: {filename}"}
+            
+            # 执行删除
+            self.vectorstore._collection.delete(ids=ids_to_delete)
+            
+            # Step 2: 从内存中的 all_chunks 也删除
+            self.all_chunks = [
+                doc for doc in self.all_chunks 
+                if doc.metadata.get("source", "") != source 
+                and Path(doc.metadata.get("source", "")).name != filename
+            ]
+            
+            # Step 3: 重建检索器（因为 BM25 需要更新）
+            remaining_count = self.vectorstore._collection.count()
+            if remaining_count > 0:
+                self._build_advanced_retriever()
+                self._build_chain()
+            else:
+                self.advanced_retriever = None
+                self.rag_chain = None
+            
+            logger.info(f"🗑️ 已删除 {filename} 的 {len(ids_to_delete)} 个文档块")
+            return {
+                "status": "success",
+                "filename": filename,
+                "deleted_chunks": len(ids_to_delete),
+                "remaining_chunks": remaining_count,
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ 删除文档失败: {e}")
+            return {"error": str(e)}
+        
+    def add_documents(self, file_paths: list[str]) -> dict:
+        """
+        向已有知识库中追加新文档
+        file_paths: 文件路径列表
+        """
+        if not self.embeddings:
+            return {"error": "Embedding 模型未初始化"}
+        
+        all_new_docs = []
+        
+        for file_path in file_paths:
+            path = Path(file_path)
+            if not path.exists():
+                continue
+            
+            # 根据文件类型选择 Loader
+            try:
+                if path.suffix.lower() == ".pdf":
+                    loader = PyPDFLoader(str(path))
+                elif path.suffix.lower() in (".md", ".txt"):
+                    loader = TextLoader(str(path), encoding="utf-8")
+                else:
+                    logger.warning(f"⚠️ 不支持的文件类型: {path.suffix}")
+                    continue
+                
+                docs = loader.load()
+                all_new_docs.extend(docs)
+            except Exception as e:
+                logger.warning(f"⚠️ 加载 {path.name} 失败: {e}")
+        
+        if not all_new_docs:
+            return {"error": "没有成功加载任何文档"}
+        
+        # 切分文档
+        new_chunks = self.splitter.split_documents(all_new_docs)
+        
+        # 为每个 chunk 生成唯一 ID
+        chunk_ids = []
+        for i, chunk in enumerate(new_chunks):
+            source = chunk.metadata.get("source", "unknown")
+            chunk_ids.append(self._generate_chunk_id(source, i))
+        
+        # 追加到向量库
+        if self.vectorstore is None:
+            # 首次建库
+            self.vectorstore = Chroma.from_documents(
+                documents=new_chunks,
+                embedding=self.embeddings,
+                ids=chunk_ids,
+                collection_name=config.COLLECTION_NAME,
+                persist_directory=config.CHROMA_PERSIST_DIR,
+            )
+        else:
+            # 追加到已有库
+            # ⚠️ 先删除同名文件（避免重复）
+            for file_path in file_paths:
+                source = str(Path(file_path).resolve())
+                filename = Path(file_path).name
+                try:
+                    existing = self.vectorstore._collection.get(
+                        where={"source": {"$contains": filename}},
+                        include=[]
+                    )
+                    if existing["ids"]:
+                        self.vectorstore._collection.delete(ids=existing["ids"])
+                        logger.info(f"🔄 覆盖已有文件: {filename}")
+                except:
+                    pass
+            
+            # 添加新文档
+            self.vectorstore.add_documents(documents=new_chunks, ids=chunk_ids)
+        
+        # 更新内存中的 chunks
+        self.all_chunks.extend(new_chunks)
+        
+        # 重建检索器
+        self._build_advanced_retriever()
+        self._build_chain()
+        
+        stats = {
+            "status": "success",
+            "新增文件数": len(all_new_docs),
+            "新增文本块数": len(new_chunks),
+            "知识库总块数": self.vectorstore._collection.count(),
+        }
+        logger.info(f"✅ 追加文档完成: {stats}")
+        return stats
+    
+    def clear_all(self) -> dict:
+        """清空整个知识库"""
+        try:
+            import shutil
+            if os.path.exists(config.CHROMA_PERSIST_DIR):
+                shutil.rmtree(config.CHROMA_PERSIST_DIR)
+            
+            self.vectorstore = None
+            self.all_chunks = []
+            self.advanced_retriever = None
+            self.rag_chain = None
+            
+            logger.info("🗑️ 知识库已清空")
+            return {"status": "success", "message": "知识库已完全清空"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def upload_files_to_temp(self, files) -> list[str]:
+        """
+        将 Gradio 上传的文件保存到临时目录
+        files: Gradio File 组件返回的文件对象列表
+        返回：保存后的文件路径列表
+        """
+        upload_dir = Path("./uploaded_docs")
+        upload_dir.mkdir(exist_ok=True)
+        
+        saved_paths = []
+        for file in files:
+            # Gradio 上传的文件是一个临时路径
+            src_path = Path(file.name if hasattr(file, 'name') else file)
+            dest_path = upload_dir / src_path.name
+            # 复制文件
+            import shutil
+            shutil.copy2(str(src_path), str(dest_path))
+            saved_paths.append(str(dest_path))
+        
+        return saved_paths
