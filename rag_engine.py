@@ -14,6 +14,8 @@ from langchain_community.document_loaders import (
     TextLoader,
     PyPDFLoader,
     UnstructuredMarkdownLoader,
+    Docx2txtLoader,  # 🌟 新增：Word 文档加载器
+    DirectoryLoader,
 )
 from langchain_community.document_loaders import DirectoryLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -249,12 +251,22 @@ class RAGEngine:
             loader_kwargs={"encoding": "utf-8"},
             show_progress=True,
         )
+        # 🌟 新增：加载 Word (.docx) 文件
+        docx_loader = DirectoryLoader(
+            docs_dir, 
+            glob="**/*.docx", 
+            loader_cls=Docx2txtLoader, 
+            show_progress=True,
+            # 如果遇到损坏的 docx 文件，跳过而不是让整个程序崩溃
+            use_multithreading=True, 
+        )
         
         txt_loader = DirectoryLoader(docs_dir, glob="**/*.txt", loader_cls=TextLoader, loader_kwargs={"encoding": "utf-8"}, show_progress=True)
         pdf_loader = DirectoryLoader(docs_dir, glob="**/*.pdf", loader_cls=PyPDFLoader, show_progress=True)
         md_loader = DirectoryLoader(docs_dir, glob="**/*.md", loader_cls=TextLoader, loader_kwargs={"encoding": "utf-8"}, show_progress=True)
+        # docx_loader = DirectoryLoader(docs_dir, glob="**/*.docx", loader_cls=Docx2txtLoader,loader_kwargs={"encoding": "utf-8"},show_progress=True)
 
-        for loader in [txt_loader, pdf_loader, md_loader]:
+        for loader in [txt_loader, pdf_loader, md_loader,docx_loader]:
             try:
                 docs = loader.load()
                 all_docs.extend(docs)
@@ -464,6 +476,9 @@ class RAGEngine:
                     loader = PyPDFLoader(str(path))
                 elif path.suffix.lower() in (".md", ".txt"):
                     loader = TextLoader(str(path), encoding="utf-8")
+                # 🌟 新增：处理 Word 文档
+                elif path.suffix.lower() == ".docx":
+                    loader = Docx2txtLoader(str(path))
                 else:
                     logger.warning(f"⚠️ 不支持的文件类型: {path.suffix}")
                     continue
