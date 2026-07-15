@@ -1,0 +1,202 @@
+"""
+个人知识库 AI 助手 - Web 界面
+"""
+import gradio as gr
+import logging
+import os
+
+from rag_engine import RAGEngine
+import config
+
+# 配置日志
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+
+# 初始化 RAG 引擎
+engine = RAGEngine()
+
+
+# ===== 功能函数 =====
+
+def build_index(docs_dir: str):
+    """构建知识库索引"""
+    if not docs_dir:
+        docs_dir = config.DOCS_DIR
+    
+    result = engine.load_documents(docs_dir)
+    info = engine.get_index_info()
+    
+    status = f"📊 索引信息:\n"
+    for k, v in info.items():
+        status += f"  • {k}: {v}\n"
+    for k, v in result.items():
+        status += f"  • {k}: {v}\n"
+    
+    return status
+
+
+# def chat_fn(message: str, history: list) -> str:
+#     """聊天处理"""
+#     if not message.strip():
+#         return ""
+    
+#     response = ""
+#     for chunk in engine.query_stream(message):
+#         response += chunk
+    
+#     # 附加来源信息
+#     sources = engine.get_sources(message)
+#     if sources:
+#         response += "\n\n---\n📚 **参考来源:**\n"
+#         for i, src in enumerate(sources, 1):
+#             response += f"  {i}. 📄 {src['filename']}\n"
+    
+#     return response
+def chat_fn(message: str, history: list[dict]):
+    """聊天处理（真·流式输出）"""
+    if not message.strip():
+        yield ""
+        return
+    
+    response = ""
+    # 🔥 每收到一个 chunk，就 yield 给前端，实现打字机效果
+    for chunk in engine.query_stream(message):
+        response += chunk
+        yield response  
+    
+    # 生成完毕后，附加来源信息，再 yield 最后一次
+    sources = engine.get_sources(message)
+    if sources:
+        response += "\n\n---\n📚 **参考来源:**\n"
+        for i, src in enumerate(sources, 1):
+            response += f"  {i}. 📄 {src['filename']}\n"
+        yield response  # 最后更新一次带来源的完整内容
+
+def upload_and_index(files):
+    """处理上传的文件并建立索引"""
+    if not files:
+        return "⚠️ 请选择要上传的文件"
+    
+    # 创建临时目录
+    upload_dir = "./uploaded_docs"
+    os.makedirs(upload_dir, exist_ok=True)
+    
+    # 保存文件
+    saved_files = []
+    for file in files:
+        filename = os.path.basename(file.name)
+        dest = os.path.join(upload_dir, filename)
+        # 复制文件
+        with open(file.name, "rb") as src, open(dest, "wb") as dst:
+            dst.write(src.read())
+        saved_files.append(filename)
+    
+    # 建立索引
+    result = engine.load_documents(upload_dir)
+    
+    msg = f"📁 上传了 {len(saved_files)} 个文件:\n"
+    for f in saved_files:
+        msg += f"  • {f}\n"
+    msg += "\n"
+    for k, v in result.items():
+        msg += f"  • {k}: {v}\n"
+    
+    return msg
+
+
+# ===== 构建 Gradio 界面 =====
+
+with gr.Blocks(
+    title="📚 个人知识库 AI 助手",
+) as demo:
+    
+    gr.Markdown("""
+    # 📚 个人知识库 AI 助手
+    > 上传你的文档（PDF / Markdown / TXT），AI 读懂它们，然后回答你的任何问题！
+    > 
+    > 基于 RAG（检索增强生成）技术 | Powered by Qwen3 + LangChain
+    """)
+    
+    with gr.Tabs():
+        # ===== Tab 1: 聊天 =====
+        with gr.Tab("💬 知识库问答"):
+            chatbot = gr.ChatInterface(
+                fn=chat_fn,
+                # type="messages",Gradio 6.0 默认就是 messages，传了会报错
+                examples=[
+                    "这个知识库里有哪些内容？",
+                    "总结一下 Python 的并发编程模型",
+                    "FastAPI 和 Flask 有什么区别？",
+                ],
+            )
+        
+        # ===== Tab 2: 文档管理 =====
+        with gr.Tab("📁 文档管理"):
+            gr.Markdown("### 上传文档建立知识库")
+            
+            file_upload = gr.File(
+                label="上传文件（支持 .txt, .pdf, .md）",
+                file_count="multiple",
+                file_types=[".txt", ".pdf", ".md"],
+            )
+            
+            upload_btn = gr.Button("📤 上传并建立索引", variant="primary")
+            upload_status = gr.Textbox(label="状态", lines=6, interactive=False)
+            
+            upload_btn.click(
+                fn=upload_and_index,
+                inputs=[file_upload],
+                outputs=[upload_status],
+            )
+            
+            gr.Markdown("---")
+            gr.Markdown("### 或指定本地文档目录")
+            
+            docs_input = gr.Textbox(
+                label="文档目录路径",
+                value=config.DOCS_DIR,
+                placeholder="./docs",
+            )
+            
+            build_btn = gr.Button("🔨 构建索引", variant="secondary")
+            build_status = gr.Textbox(label="索引状态", lines=4, interactive=False)
+            
+            build_btn.click(
+                fn=build_index,
+                inputs=[docs_input],
+                outputs=[build_status],
+            )
+        
+        # ===== Tab 3: 关于 =====
+        with gr.Tab("ℹ️ 关于"):
+            gr.Markdown(f"""
+            ### 🛠️ 技术栈
+            - **大模型**: {config.CHAT_MODEL}（阿里云百炼）
+            - **Embedding**: {config.EMBEDDING_MODEL}
+            - **向量数据库**: ChromaDB
+            - **框架**: LangChain + Gradio
+            - **技术**: RAG（检索增强生成）
+            
+            ### 📖 RAG 工作原理
+            1. **文档切分**: 把你的文档切成小块
+            2. **向量化**: 把文字变成数字向量
+            3. **存储**: 存入向量数据库
+            4. **检索**: 你提问时，找到最相关的文档块
+            5. **增强**: 把文档块塞进提示词
+            6. **生成**: AI 基于真实文档回答
+            
+            ### 💡 使用提示
+            - 支持 PDF、Markdown、TXT 格式
+            - 文档越结构化（有标题、分段落），效果越好
+            - 提问越具体，检索越准确
+            """)
+
+# 启动
+if __name__ == "__main__":
+    demo.launch(
+        # server_name="0.0.0.0",  # .0.0.0 是告诉"服务器监听所有网卡"，但 Windows 的浏览器不认这个地址。
+        server_name="127.0.0.1",  # 改成本地回环地址，Windows 浏览器完美识别
+        server_port=7860,
+        share=False,  # 设为 True 可生成公网链接
+        theme=gr.themes.Soft(primary_hue="blue"),
+    )
