@@ -1,13 +1,14 @@
 """
 RAG 引擎：负责文档加载、切分、索引、检索和问答
+Advanced RAG 引擎：负责文档加载、切分、混合检索、重排序和问答
 """
 import os
 import logging
 from pathlib import Path
 
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-# from langchain_community.vectorstores import Chroma 
-from langchain_chroma import Chroma
+# from langchain_community.vectorstores import Chroma  # 旧的导入
+from langchain_chroma import Chroma 
 from langchain_community.document_loaders import (
     TextLoader,
     PyPDFLoader,
@@ -20,6 +21,25 @@ from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.documents import Document
 
+# 🌟 新增：Advanced RAG 核心组件
+# from langchain.retrievers.multi_query import MultiQueryRetriever  #  官方已经把旧代码移到了 langchain-classic 包
+# from langchain.retrievers import EnsembleRetriever, ContextualCompressionRetriever # 官方已经把旧代码移到了 langchain-classic 包
+# from langchain.retrievers.document_compressors import CrossEncoderReranker # 移动到了langchain-classic包里
+from langchain_community.retrievers import BM25Retriever
+# from langchain_huggingface import HuggingFaceCrossEncoder #  实际上被归类在社区包（Community） 的交叉编码器模块下
+from langchain_community.cross_encoders import HuggingFaceCrossEncoder
+
+
+# 1. 多查询检索器
+from langchain_classic.retrievers.multi_query import MultiQueryRetriever
+# 2. 混合检索器 & 上下文压缩检索器
+from langchain_classic.retrievers import (
+    EnsembleRetriever, 
+    ContextualCompressionRetriever
+)
+# 3. 交叉编码器重排序器
+from langchain_classic.retrievers.document_compressors import CrossEncoderReranker
+
 import config
 
 logger = logging.getLogger(__name__)
@@ -29,15 +49,16 @@ class RAGEngine:
     """个人知识库 RAG 引擎"""
     
     def __init__(self):
-        # 初始化 LLM
+        # 1.初始化 LLM
         self.llm = ChatOpenAI(
             model=config.CHAT_MODEL,
             api_key=config.API_KEY,
             base_url=config.BASE_URL,
-            temperature=0.3,  # RAG 场景用低温度，确保准确性
+            # temperature=0.3,  # RAG 场景用低温度，确保准确性
+            temperature=0.1,  # 🔥 Advanced RAG 建议降低温度，让模型更忠实于检索内容.在 Advanced RAG 中，我们已经通过 Reranker 保证了喂给大模型的上下文是极度精准的
         )
         
-        # 初始化 Embedding 模型
+        # 2.初始化 Embedding 模型
         self.embeddings = OpenAIEmbeddings(
             model=config.EMBEDDING_MODEL,
             api_key=config.API_KEY,
@@ -46,29 +67,91 @@ class RAGEngine:
             chunk_size=10,                     # 🔥 控制每次发送的文本块数量，防止单次请求超限
         )
         
-        # 初始化向量数据库
+        # 3.初始化向量数据库与检索器占位
         self.vectorstore = None
-        self.retriever = None
+        self.all_chunks = []       # 🔥 新增：保存所有文档块，用于 BM25
+        # （多查询）检索器
+        # self.retriever = None
+        self.advanced_retriever = None  # 🔥 改名：现在是高级检索器
         self.rag_chain = None
         
-        # 文档切分器
+        # 4. 文档切分器
         self.splitter = RecursiveCharacterTextSplitter(
             chunk_size=config.CHUNK_SIZE,
             chunk_overlap=config.CHUNK_OVERLAP,
             separators=["\n\n", "\n", "。", ".", "！", "!", "？", "?", " ", ""],
         )
         
-        # 构建 RAG Chain 的提示词
+        # 5. 构建 RAG Chain 的提示词
         self.rag_prompt = ChatPromptTemplate.from_messages([
             ("system", config.SYSTEM_PROMPT),
             ("user", "{question}"),
         ])
         
+        # 6. 🌟 新增：预加载 Reranker 模型 (Cross-Encoder)
+        # 首次运行会自动下载模型(约1.1G)，后续会走本地缓存:C:\Users\yiquan\.cache\huggingface\hub\models--BAAI--bge-reranker-base
+        logger.info("⏳ 正在加载 Reranker 重排序模型 (BAAI/bge-reranker-base)...")
+        try:
+            # 这里使用 base 版本，体积更小，速度更快。如果需要极致精度可换 bge-reranker-v2-m3
+            self.cross_encoder = HuggingFaceCrossEncoder(model_name="BAAI/bge-reranker-base")
+            logger.info("✅ Reranker 模型加载完成")
+        except Exception as e:
+            logger.error(f"❌ Reranker 加载失败: {e}。将降级为基础 RAG。")
+            self.cross_encoder = None
+            
         # 尝试加载已有索引
         self._try_load_existing_index()
+
+
+    def _build_advanced_retriever(self):
+        """
+        🌟 核心改造：组装 Advanced 检索器
+        流程：向量检索 + BM25 -> 混合检索 -> 多查询改写 -> 重排序
+        如何验证 Advanced RAG 真的生效了:
+        在 Gradio 界面提问一个包含生僻专有名词的问题（比如你们公司内部的某个项目代号），观察 get_sources 返回的参考文档。
+        如果是基础 RAG，它大概率会搜偏；换成 Advanced RAG 后，你会发现 BM25 会死死咬住那个专有名词，Reranker 会把最准的那条排在第一位
+        """
+        if not self.vectorstore or not self.all_chunks:
+            logger.warning("⚠️ 向量库或文档块为空，无法构建高级检索器")
+            return
+
+        # Step A: 基础向量检索器 (召回 Top 15 供后续精排)
+        vector_retriever = self.vectorstore.as_retriever(search_kwargs={"k": 15})
+        
+        # Step B: BM25 关键词检索器 (召回 Top 15)
+        logger.info("🔧 正在构建 BM25 索引...")
+        bm25_retriever = BM25Retriever.from_documents(self.all_chunks)
+        bm25_retriever.k = 15
+        
+        # Step C: 🌟 混合检索 (Ensemble) - 权重可调
+        ensemble_retriever = EnsembleRetriever(
+            retrievers=[bm25_retriever, vector_retriever],
+            weights=[0.4, 0.6]  # 语义占 60%，关键词占 40%
+        )
+        logger.info("✅ 混合检索器 (BM25 + Vector) 构建完成")
+
+        # Step D: 🌟 查询改写 (Multi-Query)
+        multi_retriever = MultiQueryRetriever.from_llm(
+            retriever=ensemble_retriever, 
+            llm=self.llm
+        )
+        logger.info("✅ 多查询改写器构建完成")
+
+        # Step E: 🌟 重排序 (Reranker)
+        if self.cross_encoder:
+            compressor = CrossEncoderReranker(model=self.cross_encoder, top_n=config.TOP_K)
+            self.advanced_retriever = ContextualCompressionRetriever(
+                base_compressor=compressor,
+                base_retriever=multi_retriever
+            )
+            logger.info(f"✅ 重排序器构建完成 (最终保留 Top {config.TOP_K})")
+        else:
+            # 降级处理
+            self.advanced_retriever = multi_retriever
+            logger.warning("⚠️ Reranker 不可用，已降级为 Multi-Query 检索")    
     
     def _try_load_existing_index(self):
-        """尝试加载已有的向量数据库"""
+        """尝试加载已有的向量数据库，并重建 BM25 所需的 chunks"""
         if os.path.exists(config.CHROMA_PERSIST_DIR):
             try:
                 self.vectorstore = Chroma(
@@ -79,11 +162,25 @@ class RAGEngine:
                 # 检查是否有数据
                 count = self.vectorstore._collection.count()
                 if count > 0:
-                    self.retriever = self.vectorstore.as_retriever(
-                        search_kwargs={"k": config.TOP_K}
-                    )
+                    logger.info(f"✅ 加载已有向量库，包含 {count} 个文档块")
+                    # 🔥 关键：从 Chroma 反向提取所有文档，重建 all_chunks 供 BM25 使用
+                    raw_data = self.vectorstore._collection.get(include=["documents", "metadatas"])
+                    self.all_chunks = [
+                        Document(page_content=doc, metadata=meta)
+                        for doc, meta in zip(raw_data["documents"], raw_data["metadatas"])
+                    ]
+                    logger.info(f"✅ 已从向量库反向恢复 {len(self.all_chunks)} 个文档块用于 BM25")
+
+                    # 构建高级检索器和 Chain
+                    self._build_advanced_retriever()
                     self._build_chain()
-                    logger.info(f"✅ 加载已有索引，包含 {count} 个文档块")
+
+                    # self.retriever = self.vectorstore.as_retriever(
+                    #     search_kwargs={"k": config.TOP_K}
+                    # )
+                    # self._build_chain()
+                    # logger.info(f"✅ 加载已有索引，包含 {count} 个文档块")
+
                 else:
                     self.vectorstore = None
             except Exception as e:
@@ -91,13 +188,13 @@ class RAGEngine:
                 self.vectorstore = None
     
     def _build_chain(self):
-        """构建 RAG Chain"""
-        if not self.retriever:
+        """构建 RAG LCEL Chain"""
+        if not self.advanced_retriever:
             return
         
         self.rag_chain = (
             {
-                "context": self.retriever | self._format_docs,
+                "context": self.advanced_retriever | self._format_docs,
                 "question": RunnablePassthrough(),
             }
 
@@ -152,6 +249,10 @@ class RAGEngine:
             show_progress=True,
         )
         
+        txt_loader = DirectoryLoader(docs_dir, glob="**/*.txt", loader_cls=TextLoader, loader_kwargs={"encoding": "utf-8"}, show_progress=True)
+        pdf_loader = DirectoryLoader(docs_dir, glob="**/*.pdf", loader_cls=PyPDFLoader, show_progress=True)
+        md_loader = DirectoryLoader(docs_dir, glob="**/*.md", loader_cls=TextLoader, loader_kwargs={"encoding": "utf-8"}, show_progress=True)
+
         for loader in [txt_loader, pdf_loader, md_loader]:
             try:
                 docs = loader.load()
@@ -163,7 +264,7 @@ class RAGEngine:
             return {"error": "未找到任何文档（支持 .txt, .pdf, .md）"}
         
         # 切分文档
-        chunks = self.splitter.split_documents(all_docs)
+        chunks = self.splitter.split_documents(all_docs) #  🔥 存入实例变量
         
         # 存入向量数据库
         self.vectorstore = Chroma.from_documents(
@@ -174,21 +275,22 @@ class RAGEngine:
         )
         
         # 创建检索器
-        self.retriever = self.vectorstore.as_retriever(
-            search_kwargs={"k": config.TOP_K}
-        )
+        # self.retriever = self.vectorstore.as_retriever(
+        #     search_kwargs={"k": config.TOP_K}
+        # )
         
-        # 构建 Chain
+        # 🌟 构建高级检索器和 Chain
+        self._build_advanced_retriever()
         self._build_chain()
         
         stats = {
             "文件数": len(all_docs),
             "文本块数": len(chunks),
-            "状态": "✅ 索引构建成功",
+            "状态": "✅ Advanced RAG 索引构建成功",
         }
         logger.info(f"✅ 索引完成: {stats}")
         return stats
-    
+    # -------- ---------
     def query(self, question: str) -> str:
         """提问（非流式）"""
         if not self.rag_chain:
@@ -206,10 +308,10 @@ class RAGEngine:
     
     def get_sources(self, question: str) -> list[dict]:
         """获取问题相关的文档来源"""
-        if not self.retriever:
+        if not self.advanced_retriever:
             return []
         
-        docs = self.retriever.invoke(question)
+        docs = self.advanced_retriever.invoke(question)
         sources = []
         for doc in docs:
             sources.append({
