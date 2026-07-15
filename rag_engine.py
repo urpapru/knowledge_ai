@@ -568,3 +568,77 @@ class RAGEngine:
             saved_paths.append(str(dest_path))
         
         return saved_paths
+    
+
+    def debug_retrieval(self, question: str) -> dict:
+        """
+        为了让"检索透视"生效，先给 RAGEngine 加一个调试方法
+        🔍 检索过程透视：返回检索链路每一步的详细结果
+        用于在 Gradio 中可视化展示
+        
+        """
+        if not self.vectorstore:
+            return {"error": "知识库未构建"}
+        
+        result = {
+            "original_query": question,
+            "rewritten_queries": [],
+            "vector_results": [],
+            "bm25_results": [],
+            "merged_results": [],
+            "reranked_results": [],
+        }
+        
+        try:
+            # Step 1: 查询改写
+            # from langchain.prompts import ChatPromptTemplate as CPT
+            from langchain_core.prompts import ChatPromptTemplate as CPT
+            rewrite_prompt = CPT.from_template(
+                "你是一个查询改写专家。请将用户的问题改写为 3 个不同角度的搜索查询，每行一个，不要输出其他内容。\n\n用户问题: {question}"
+            )
+            rewrite_chain = rewrite_prompt | self.llm | StrOutputParser()
+            rewritten = rewrite_chain.invoke({"question": question})
+            result["rewritten_queries"] = [q.strip() for q in rewritten.strip().split("\n") if q.strip()]
+            
+            # Step 2: 向量检索 (Top 10)
+            vector_retriever = self.vectorstore.as_retriever(search_kwargs={"k": 10})
+            all_queries = [question] + result["rewritten_queries"]
+            
+            vector_docs = {}
+            for q in all_queries:
+                for doc in vector_retriever.invoke(q):
+                    doc_id = hashlib.md5(doc.page_content.encode()).hexdigest()[:12]
+                    if doc_id not in vector_docs:
+                        vector_docs[doc_id] = doc
+            result["vector_results"] = [
+                {"content": d.page_content[:100], "source": Path(d.metadata.get("source", "")).name}
+                for d in list(vector_docs.values())[:10]
+            ]
+            
+            # Step 3: BM25 检索 (Top 10)
+            if self.all_chunks:
+                bm25 = BM25Retriever.from_documents(self.all_chunks)
+                bm25.k = 10
+                bm25_docs = bm25.invoke(question)
+                result["bm25_results"] = [
+                    {"content": d.page_content[:100], "source": Path(d.metadata.get("source", "")).name}
+                    for d in bm25_docs
+                ]
+            
+            # Step 4: 最终精排结果
+            if self.advanced_retriever:
+                final_docs = self.advanced_retriever.invoke(question)
+                result["reranked_results"] = [
+                    {
+                        "rank": i + 1,
+                        "content": d.page_content[:150],
+                        "source": Path(d.metadata.get("source", "")).name,
+                    }
+                    for i, d in enumerate(final_docs)
+                ]
+            
+        except Exception as e:
+            result["error"] = str(e)
+            logger.error(f"检索调试失败: {e}")
+    
+        return result
