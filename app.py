@@ -55,6 +55,16 @@ def chat_fn(message: str, history: list) -> str:
     
     return response
 
+def clear_rag_memory_fn():
+    """清空 RAG 对话记忆"""
+    msg = engine.clear_qa_memory()
+    return msg
+
+def clear_data_memory_fn():
+    """清空数据分析记忆"""
+    msg = engine.clear_data_memory()
+    return msg
+
 #                         功能函数补充
 # ===================================================================
 
