@@ -46,6 +46,21 @@ from langchain_classic.retrievers import (
 # 3. 交叉编码器重排序器
 from langchain_classic.retrievers.document_compressors import CrossEncoderReranker
 
+# 🌟 纯 LCEL 核心组件 (完全基于 langchain-core)
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.runnables import RunnablePassthrough, RunnableParallel
+from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_core.chat_history import BaseChatMessageHistory
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.documents import Document
+
+# 记忆与历史
+from langchain_community.chat_message_histories import ChatMessageHistory
+
+# Agent 相关 (LangGraph)
+from langgraph.checkpoint.memory import MemorySaver
+from langchain_experimental.agents.agent_toolkits import create_pandas_dataframe_agent
+
 import config
 
 logger = logging.getLogger(__name__)
@@ -198,20 +213,49 @@ class RAGEngine:
                 self.vectorstore = None
     
     def _build_chain(self):
-        """构建 RAG LCEL Chain"""
+        """构建 带记忆的 RAG LCEL Chain"""
         if not self.advanced_retriever:
             return
         
-        self.rag_chain = (
-            {
-                "context": self.advanced_retriever | self._format_docs,
-                "question": RunnablePassthrough(),
-            }
+        # 🌟 1. 重构 Prompt：注入 MessagesPlaceholder
+        # 注意：这里假设 config.SYSTEM_PROMPT 是系统提示词字符串
+        self.rag_prompt_with_history = ChatPromptTemplate.from_messages([
+            ("system", config.SYSTEM_PROMPT + "\n\n请参考以下上下文信息:\n{context}"),
+            MessagesPlaceholder(variable_name="chat_history"), # 🌟 注入历史对话
+            ("human", "{question}"),
+        ])
 
-            | self.rag_prompt
+        # 🌟 2. 构建基础 RAG Chain (纯 LCEL)
+        base_rag_chain = (
+            RunnablePassthrough.assign(
+                context=lambda x: self._format_docs(self.advanced_retriever.invoke(x["question"]))
+            )
+
+            | self.rag_prompt_with_history
             | self.llm
             | StrOutputParser()
         )
+        # 🌟 3. 核心：包裹 RunnableWithMessageHistory
+        self.rag_chain_with_history = RunnableWithMessageHistory(
+            base_rag_chain,
+            self._get_qa_session_history,
+            input_messages_key="question",
+            history_messages_key="chat_history",
+        )
+
+        # 保留原有的无记忆 chain 用于 get_sources 等不需要历史的场景
+        self.rag_chain = base_rag_chain
+
+        # self.rag_chain = (
+        #     {
+        #         "context": self.advanced_retriever | self._format_docs,
+        #         "question": RunnablePassthrough(),
+        #     }
+
+        #     | self.rag_prompt
+        #     | self.llm
+        #     | StrOutputParser()
+        # )
     
     def _format_docs(self, docs: list[Document]) -> str:
         """格式化检索到的文档"""
