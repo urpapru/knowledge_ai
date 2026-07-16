@@ -7,8 +7,13 @@ import logging
 from pathlib import Path
 import hashlib
 import pandas as pd
+
+from typing import List, Dict, Any
+import uuid
+
 from langchain_experimental.agents.agent_toolkits import create_pandas_dataframe_agent
 from langchain_core.messages import HumanMessage, AIMessage
+
 
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 # from langchain_community.vectorstores import Chroma  # 旧的导入
@@ -127,6 +132,17 @@ class RAGEngine:
         # 尝试加载已有索引
         self._try_load_existing_index()
 
+        # 🌟 新版 RAG 记忆：使用字典存储不同 session 的历史
+        self.qa_store = {}
+        
+        # 🌟 新版 Agent 记忆：使用 LangGraph 的 MemorySaver
+        self.agent_checkpointer = MemorySaver()
+        self.data_agent = None
+        
+        # 用于区分不同会话的 ID
+        self.qa_session_id = str(uuid.uuid4())
+        self.data_session_id = str(uuid.uuid4())
+        
 
     def _build_advanced_retriever(self):
         """
