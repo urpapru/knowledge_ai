@@ -142,8 +142,100 @@ class RAGEngine:
         # 用于区分不同会话的 ID
         self.qa_session_id = str(uuid.uuid4())
         self.data_session_id = str(uuid.uuid4())
-        
+     
+    def _get_qa_session_history(self, session_id: str) -> BaseChatMessageHistory:
+        """获取 RAG 问答的 session 历史"""
+        if session_id not in self.qa_store:
+            self.qa_store[session_id] = ChatMessageHistory()
+        return self.qa_store[session_id]    
 
+    @staticmethod
+    def _format_docs(docs: List[Document]) -> str:
+        """将检索到的文档列表格式化为纯文本字符串"""
+        return "\n\n".join(doc.page_content for doc in docs)
+
+    def chat_with_memory(self, question: str) -> dict:
+        """
+        🌟 纯 LCEL 带记忆的知识问答 (兼容 LangChain 1.x / langchain-core 1.x)
+        """
+        if not hasattr(self, 'retriever') or self.retriever is None:
+            return {"answer": "⚠️ 知识库未初始化，请先上传文档！", "sources": []}
+        
+        try:
+            # 1. 定义 System Prompt
+            system_prompt = (
+                "你是一个专业的知识库问答助手。请使用以下检索到的上下文来回答用户的问题。\n"
+                "如果你不知道答案，就说你不知道，不要编造。\n"
+                "保持回答简洁专业。\n\n"
+                "上下文:\n{context}"
+            )
+            
+            # 2. 构建 Prompt 模板 (包含历史占位符)
+            prompt = ChatPromptTemplate.from_messages(
+                [
+                    ("system", system_prompt),
+                    MessagesPlaceholder("chat_history"), # 🌟 注入历史对话
+                    ("human", "{input}"),
+                ]
+            )
+            
+            # 3. 🌟 核心：使用纯 LCEL (管道符 |) 构建 RAG Chain
+            # 输入字典: {"input": "问题", "chat_history": [历史消息]}
+            # RunnablePassthrough.assign 会保留原有的 key，并新增 "context" key
+            rag_chain = (
+                RunnablePassthrough.assign(
+                    context=lambda x: self._format_docs(self.retriever.invoke(x["input"]))
+                )
+
+                | prompt
+                | self.llm
+                | StrOutputParser()
+            )
+            
+            # 4. 🌟 包裹 RunnableWithMessageHistory 实现记忆
+            rag_chain_with_history = RunnableWithMessageHistory(
+                rag_chain,
+                self._get_qa_session_history,
+                input_messages_key="input",
+                history_messages_key="chat_history",
+            )
+            
+            # 5. 执行调用 (传入 session_id)
+            config = {"configurable": {"session_id": self.qa_session_id}}
+            
+            # invoke 返回的是 StrOutputParser 解析后的纯字符串
+            answer_text = rag_chain_with_history.invoke(
+                {"input": question}, 
+                config=config
+            )
+            
+            # 6. 单独获取来源信息 (因为纯 LCEL 链最终只输出了字符串)
+            # 为了给用户展示来源，我们手动再检索一次 (或者在链中用 RunnableParallel 返回字典，但那样处理 history 会更复杂)
+            # 对于展示来源，手动检索一次是最稳妥且解耦的做法
+            source_docs = self.retriever.invoke(question)
+            sources = []
+            for doc in source_docs:
+                sources.append({
+                    "content": doc.page_content[:100] + "...",
+                    "source": doc.metadata.get("source", "未知"),
+                    "filename": doc.metadata.get("filename", "未知")
+                })
+            
+            return {
+                "answer": answer_text,
+                "sources": sources
+            }
+        except Exception as e:
+            logger.error(f"❌ 问答失败: {e}")
+            return {"answer": f"回答失败: {str(e)}", "sources": []}
+
+    def clear_qa_memory(self):
+        """清空知识问答记忆 (重置 session)"""
+        self.qa_session_id = str(uuid.uuid4()) # 生成新 ID 即可变相清空
+        return "✅ 对话记忆已清空！"
+    
+
+    
     def _build_advanced_retriever(self):
         """
         🌟 核心改造：组装 Advanced 检索器
@@ -424,6 +516,8 @@ class RAGEngine:
                 agent_type="openai-tools",
                 verbose=True, # 打印 AI 思考和写代码的过程
                 allow_dangerous_code=True, 
+                checkpointer=self.agent_checkpointer, # 🌟 注入 LangGraph Checkpointer
+
                 prefix="你是一个专业的数据分析师。你可以使用 Pandas 对提供的 DataFrame 进行数据分析。请使用中文回答。",
             )
             
@@ -449,15 +543,27 @@ class RAGEngine:
         针对 CSV 数据进行提问分析
         """
         if not self.data_agent:
-            return "⚠️ 尚未加载 CSV 数据！请先上传 CSV 文件。"
+            return "⚠️ 尚未加载数据！请先上传 CSV/Excel 文件。"
         
         try:
             # 调用 Agent 进行分析
-            response = self.data_agent.invoke({"input": question})
+            config = {"configurable": {"thread_id": self.data_session_id}}
+            response = self.data_agent.invoke(
+                {"input": question}, 
+                config=config
+            )
             return response["output"]
         except Exception as e:
             logger.error(f"❌ 数据分析失败: {e}")
-            return f"分析失败: {str(e)}\n(可能是 AI 写的代码有 Bug，请尝试换种问法)"
+            return f"分析失败: {str(e)}"
+    def clear_data_memory(self):
+        """清空数据分析记忆 (重置 thread_id)"""
+        self.data_session_id = str(uuid.uuid4())
+        return "✅ 分析记忆已清空！"
+    
+
+
+    
     # -------- ---------
     def query(self, question: str) -> str:
         """提问（非流式）"""
