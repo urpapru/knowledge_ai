@@ -321,7 +321,7 @@ with gr.Blocks(
                         outputs=rag_memory_status
                     )
 
-                    
+
         # =====================================================
         # Tab 2: 🔍 检索透视
         # =====================================================
@@ -482,6 +482,16 @@ with gr.Blocks(
                 inputs=[data_upload],
                 outputs=[data_status, data_preview]
             )
+
+            # 🌟 新增：清空 Agent 记忆按钮
+            with gr.Row():
+                clear_data_memory_btn = gr.Button("🗑️ 清空分析记忆 (重置上下文)", variant="stop", size="sm")
+                data_memory_status = gr.Markdown("")
+                
+            clear_data_memory_btn.click(
+                fn=clear_data_memory_fn, 
+                outputs=data_memory_status
+            )    
 
 
         # =====================================================
