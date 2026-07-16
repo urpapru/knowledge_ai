@@ -309,7 +309,19 @@ with gr.Blocks(
                     
                     index_info_btn.click(refresh_info, outputs=index_info_display)
                     demo.load(refresh_info, outputs=index_info_display)  # 页面加载时自动刷新
-        
+
+                    # 🌟 新增：清空 RAG 记忆按钮
+                    gr.Markdown("---")
+                    gr.Markdown("### 🧠 对话记忆管理")
+                    clear_rag_memory_btn = gr.Button("🗑️ 清空当前对话记忆", variant="stop", size="sm")
+                    rag_memory_status = gr.Markdown("")
+                    
+                    clear_rag_memory_btn.click(
+                        fn=clear_rag_memory_fn, 
+                        outputs=rag_memory_status
+                    )
+
+                    
         # =====================================================
         # Tab 2: 🔍 检索透视
         # =====================================================
