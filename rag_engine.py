@@ -234,6 +234,18 @@ class RAGEngine:
         self.qa_session_id = str(uuid.uuid4()) # 生成新 ID 即可变相清空
         return "✅ 对话记忆已清空！"
     
+    def add_to_qa_memory(self, user_message: str, ai_message: str):
+        """
+        🌟 手动将一轮对话添加到 RAG 记忆中 (专为流式输出设计)
+        """
+        history = self._get_qa_session_history(self.qa_session_id)
+        history.add_user_message(user_message)
+        history.add_ai_message(ai_message)
+        
+        # 🌟 滑动窗口控制：只保留最近 5 轮 (10 条消息)，防止 Token 爆炸
+        # 因为 ChatMessageHistory 没有自带 k=5 功能，我们手动裁剪
+        if len(history.messages) > 10:
+            history.messages = history.messages[-10:]
 
     
     def _build_advanced_retriever(self):
