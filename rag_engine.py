@@ -311,9 +311,11 @@ class RAGEngine:
         logger.info(f"✅ 索引完成: {stats}")
         return stats
     
-    def load_csv(self, file_path: str) -> dict:
+    def load_dataframe(self, file_path: str) -> dict:
         """
         加载 CSV 文件到内存，并初始化数据分析 Agent
+        🌟 通用表格数据加载器：支持 CSV (.csv) 和 Excel (.xlsx, .xls)
+        将数据加载到内存，并初始化 Pandas Data Agent
         """
         path = Path(file_path)
 
@@ -322,20 +324,28 @@ class RAGEngine:
         # 🌟 移除或放宽后缀检查，因为 Gradio 临时文件可能没有 .csv 后缀
         if not path.exists():
             return {"error": f"文件不存在: 文件路径为:{file_path}"}
+        
+        suffix = path.suffix.lower()
+        if suffix not in [".csv", ".xlsx", ".xls"]:
+            return {"error": "不支持的文件格式，请上传 CSV 或 Excel 文件"}
         try:
             # 1. 读取 CSV
-            # df = pd.read_csv(file_path)
-                # 🌟 核心修复：自动尝试多种编码格式，彻底消灭 UnicodeDecodeError
             df = None
             # 常见的 CSV 编码顺序：UTF-8 (最通用), GBK (中文 Windows Excel 默认), latin1 (兜底，绝对不会报错)
             encodings_to_try = ['utf-8', 'gbk', 'gb2312', 'latin1'] 
             
             for enc in encodings_to_try:
                 try:
+                    if suffix == ".csv":
                     # 尝试使用当前编码读取
-                    df = pd.read_csv(file_path, encoding=enc)
-                    logger.info(f"✅ 成功使用 '{enc}' 编码读取 CSV: {path.name}")
-                    break # 读取成功，跳出循环
+                        df = pd.read_csv(file_path, encoding=enc)
+                        logger.info(f"✅ 成功使用 '{enc}' 编码读取 CSV: {path.name}")
+                        break # 读取成功，跳出循环
+                    else:
+                        # 🌟 读取 Excel：默认读取第一个 Sheet (sheet_name=0)
+                        # 如果需要读取特定 Sheet，后续可以扩展参数
+                        df = pd.read_excel(file_path, sheet_name=0)
+                        file_type_desc = f"Excel (Sheet: {df.name if hasattr(df, 'name') else 'Sheet1'})"
                 except UnicodeDecodeError:
                     # 如果解码失败，继续尝试下一个编码
                     continue
@@ -344,13 +354,19 @@ class RAGEngine:
                     logger.error(f"❌ 读取 CSV 时发生非编码错误: {e}")
                     return {"error": f"文件内容解析失败 (可能不是有效的 CSV 格式): {str(e)}"}
             
+
             # 如果所有编码都失败了（理论上 latin1 不会失败，但以防万一）
             if df is None:
                 return {"error": "无法解析文件编码，请确保文件是标准的 CSV 格式 (UTF-8 或 GBK)。"}
 
+            # 2. 基础数据清洗 (可选：去除全空的行列)
+            df.dropna(how='all', inplace=True) 
+            df.dropna(axis=1, how='all', inplace=True)
+
+            # 3. 存入内存字典
             self.dataframes[path.name] = df
             
-            # 2. 🌟 核心：创建 Pandas Data Agent
+            # 4. 🌟 核心：创建更新 Pandas Data Agent
             # 注意：这里必须使用支持工具调用的模型 (如 qwen-plus 或 qwen-max)
             # allow_dangerous_code=True 是必须的，因为 Agent 需要执行 Python 代码
             self.data_agent = create_pandas_dataframe_agent(
@@ -362,21 +378,22 @@ class RAGEngine:
                 prefix="你是一个专业的数据分析师。你可以使用 Pandas 对提供的 DataFrame 进行数据分析。请使用中文回答。",
             )
             
-            # 3. 生成数据概览
+            # 5. 生成数据概览
             rows, cols = df.shape
             columns_info = ", ".join([f"{col} ({df[col].dtype})" for col in df.columns])
             
             return {
                 "status": "success",
                 "filename": path.name,
+                "file_type": file_type_desc,
                 "rows": rows,
                 "columns": cols,
                 "columns_info": columns_info,
                 "preview": df.head(3).to_markdown(index=False) # 预览前3行
             }
         except Exception as e:
-            logger.error(f"❌ CSV 加载失败: {e}")
-            return {"error": str(e)}
+            logger.error(f"❌ 表格数据加载失败:: {e}")
+            return {"error": f"解析失败: {str(e)}。请检查文件是否损坏或包含加密/密码"}
 
     def query_data(self, question: str) -> str:
         """
