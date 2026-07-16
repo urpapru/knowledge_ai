@@ -493,6 +493,7 @@ class RAGEngine:
                     # 尝试使用当前编码读取
                         df = pd.read_csv(file_path, encoding=enc)
                         logger.info(f"✅ 成功使用 '{enc}' 编码读取 CSV: {path.name}")
+                        file_type_desc = f"CSV (编码: {enc})"  # ✅ 加上这一行
                         break # 读取成功，跳出循环
                     else:
                         # 🌟 读取 Excel：默认读取第一个 Sheet (sheet_name=0)
@@ -559,6 +560,7 @@ class RAGEngine:
         
         try:
             # 调用 Agent 进行分析
+            # 🌟 传入 thread_id (等同于 session_id)
             config = {"configurable": {"thread_id": self.data_session_id}}
             response = self.data_agent.invoke(
                 {"input": question}, 
