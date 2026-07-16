@@ -46,6 +46,56 @@ def chat_fn(message: str, history: list) -> str:
     
     return response
 
+#                         功能函数补充
+# ===================================================================
+
+def upload_csv_fn(files):
+    """处理 CSV 上传并加载到内存"""
+    # 在 Gradio 3.x (file_count="single") 中，files 直接是文件对象或字符串，不是列表！
+    if not files:
+        return "⚠️ 请选择 CSV 文件", ""
+    
+    # file_obj = files[0]
+    file_obj = files
+    # 🌟 核心修复：正确获取路径
+    if hasattr(file_obj, "name"):
+        # 如果是文件对象，取 .name 属性 (临时文件绝对路径)
+        file_path = file_obj.name
+    else:
+        # 如果直接是字符串路径，直接使用
+        file_path = str(file_obj)
+
+    # 调试信息：打印实际获取到的路径，方便排查
+    print(f"🔍 DEBUG: 解析到的文件路径 -> {file_path}")
+
+    if not file_path or not Path(file_path).exists():
+        return f"❌ 文件路径无效或不存在: {file_path}", ""
+
+    result = engine.load_csv(file_path)
+
+    # # 取第一个文件
+    # file_path = files[0].name if hasattr(files[0], 'name') else files[0]
+    # result = engine.load_csv(file_path)
+    
+    if "error" in result:
+        return f"❌ 加载失败: {result['error']}", ""
+    
+    status_md = f"""
+    ### ✅ 数据加载成功！
+    - **文件名**: `{result['filename']}`
+    - **数据规模**: {result['rows']} 行 × {result['columns']} 列
+    - **字段信息**: {result['columns_info']}
+    """
+    
+    preview_md = f"### 📊 数据预览 (前 3 行)\n{result['preview']}"
+    
+    return status_md, preview_md
+
+def data_chat_fn(question: str, history: list) -> str:
+    """处理数据分析提问"""
+    if not question.strip():
+        return ""
+    return engine.query_data(question)
 
 def debug_retrieval_fn(question: str) -> tuple[str, str, str, str]:
     """
@@ -353,7 +403,54 @@ with gr.Blocks(
                     inputs=[docs_input],
                     outputs=[build_status, doc_list_display],
                 )
-        
+        # =====================================================
+        # Tab 5: 📈 数据分析师 (CSV)
+        # =====================================================
+        with gr.Tab("📈 数据分析师", id="data"):
+            gr.Markdown("""
+            ### 📊 AI 数据分析师
+            > 上传你的 `.csv` 数据文件，AI 将自动读取表结构，并允许你用自然语言进行复杂的数据分析（如求和、分组、趋势预测）。
+            > *注：数据仅在内存中处理，不会存入向量知识库，关闭页面即销毁。*
+            """)
+            
+            with gr.Row():
+                with gr.Column(scale=1):
+                    csv_upload = gr.File(
+                        label="上传 CSV 文件",
+                        file_count="single",
+                        file_types=[".csv"],
+                        type="filepath"  # 🌟 这一行如果没加，Gradio 3.18 就会传一个奇怪的对象过来
+                    )
+                    upload_csv_btn = gr.Button("📥 加载数据", variant="primary")
+                
+                with gr.Column(scale=2):
+                    csv_status = gr.Markdown("等待上传数据...")
+                    csv_preview = gr.Markdown("")
+            
+            gr.Markdown("---")
+            
+            # 数据分析聊天区域
+            gr.Markdown("### 💬 向数据提问")
+            gr.Markdown("*例如：'哪个产品的销量最高？'、'计算每个月的平均增长率'、'画出销售额的折线图（如果支持）'*")
+            
+            data_chatbot = gr.ChatInterface(
+                fn=data_chat_fn,
+                # type="messages",
+                examples=[
+                    "帮我总结一下这份数据的基本信息",
+                    "找出数值最大的前 5 条记录",
+                    "按类别分组，计算每组的平均值",
+                ]
+            )
+            
+            # 绑定事件
+            upload_csv_btn.click(
+                fn=upload_csv_fn,
+                inputs=[csv_upload],
+                outputs=[csv_status, csv_preview]
+            )
+
+
         # =====================================================
         # Tab 4: ℹ️ 关于
         # =====================================================
