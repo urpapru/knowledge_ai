@@ -49,11 +49,11 @@ def chat_fn(message: str, history: list) -> str:
 #                         功能函数补充
 # ===================================================================
 
-def upload_csv_fn(files):
-    """处理 CSV 上传并加载到内存"""
+def upload_data_fn(files):
+    """处理 CSV /Excel上传并加载到内存"""
     # 在 Gradio 3.x (file_count="single") 中，files 直接是文件对象或字符串，不是列表！
     if not files:
-        return "⚠️ 请选择 CSV 文件", ""
+        return "⚠️ 请选择 CSV/xls/xlsx 文件", ""
     
     # file_obj = files[0]
     file_obj = files
@@ -71,7 +71,8 @@ def upload_csv_fn(files):
     if not file_path or not Path(file_path).exists():
         return f"❌ 文件路径无效或不存在: {file_path}", ""
 
-    result = engine.load_csv(file_path)
+    # 🌟 调用重构后的通用方法
+    result = engine.load_dataframe(file_path)
 
     # # 取第一个文件
     # file_path = files[0].name if hasattr(files[0], 'name') else files[0]
@@ -409,23 +410,24 @@ with gr.Blocks(
         with gr.Tab("📈 数据分析师", id="data"):
             gr.Markdown("""
             ### 📊 AI 数据分析师
-            > 上传你的 `.csv` 数据文件，AI 将自动读取表结构，并允许你用自然语言进行复杂的数据分析（如求和、分组、趋势预测）。
-            > *注：数据仅在内存中处理，不会存入向量知识库，关闭页面即销毁。*
+            > 上传你的 `.csv` 或 `.xlsx/.xls` 数据文件，AI 将自动读取表结构，并允许你用自然语言进行复杂的数据分析。
+            > *注：对于 Excel 文件，AI 默认读取第一个 Sheet 页。数据仅在内存中处理，关闭页面即销毁。*
             """)
             
             with gr.Row():
                 with gr.Column(scale=1):
-                    csv_upload = gr.File(
-                        label="上传 CSV 文件",
+                    # 🌟 核心修改：扩展 file_types，修改 label
+                    data_upload = gr.File(
+                        label="上传数据文件 (支持 .csv, .xlsx, .xls)",
                         file_count="single",
-                        file_types=[".csv"],
+                        file_types=[".csv", ".xlsx", ".xls"],
                         type="filepath"  # 🌟 这一行如果没加，Gradio 3.18 就会传一个奇怪的对象过来
                     )
-                    upload_csv_btn = gr.Button("📥 加载数据", variant="primary")
+                    upload_data_btn = gr.Button("📥 加载数据", variant="primary")
                 
                 with gr.Column(scale=2):
-                    csv_status = gr.Markdown("等待上传数据...")
-                    csv_preview = gr.Markdown("")
+                    data_status = gr.Markdown("等待上传数据...")
+                    data_preview = gr.Markdown("")
             
             gr.Markdown("---")
             
@@ -443,11 +445,11 @@ with gr.Blocks(
                 ]
             )
             
-            # 绑定事件
-            upload_csv_btn.click(
-                fn=upload_csv_fn,
-                inputs=[csv_upload],
-                outputs=[csv_status, csv_preview]
+            # 绑定事件 更新函数名和组件名
+            upload_data_btn.click(
+                fn=upload_data_fn,
+                inputs=[data_upload],
+                outputs=[data_status, data_preview]
             )
 
 
