@@ -245,17 +245,6 @@ class RAGEngine:
 
         # 保留原有的无记忆 chain 用于 get_sources 等不需要历史的场景
         self.rag_chain = base_rag_chain
-
-        # self.rag_chain = (
-        #     {
-        #         "context": self.advanced_retriever | self._format_docs,
-        #         "question": RunnablePassthrough(),
-        #     }
-
-        #     | self.rag_prompt
-        #     | self.llm
-        #     | StrOutputParser()
-        # )
     
     def _format_docs(self, docs: list[Document]) -> str:
         """格式化检索到的文档"""
@@ -461,13 +450,25 @@ class RAGEngine:
         return self.rag_chain.invoke(question)
     
     def query_stream(self, question: str):
-        """提问（流式）"""
-        if not self.rag_chain:
+        """提问（带记忆的流式输出）"""
+        if not self.rag_chain or self.rag_chain_with_history is None:
             yield "⚠️ 知识库尚未构建索引！请先上传文档。"
             return
         
-        for chunk in self.rag_chain.stream(question):
-            yield chunk
+        # 🌟 传入 session_id 配置
+        config = {"configurable": {"session_id": self.qa_session_id}}
+
+        try:
+            # 调用带记忆的 chain 进行流式输出
+            for chunk in self.rag_chain_with_history.stream(
+                {"question": question}, 
+                config=config
+            ):
+                yield chunk
+        except Exception as e:
+            logger.error(f"❌ 流式问答失败: {e}")
+            yield f"\n\n❌ 回答出错: {str(e)}"
+
     
     def get_sources(self, question: str) -> list[dict]:
         """获取问题相关的文档来源"""
