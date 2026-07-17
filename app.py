@@ -84,7 +84,7 @@ def chat_fn(message: str, history: list) -> str:
     web_results = meta.get("web_results", [])
     if web_results:
         route_badge += "\n🌐 **联网搜索来源:**\n"
-        for i, r in enumerate(web_results[:5], 1):
+        for i, r in enumerate(web_results[:10], 1):
             title = r.get("title", "无标题")[:40]
             url = r.get("url", "")
             if url:
