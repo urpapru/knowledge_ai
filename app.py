@@ -353,36 +353,72 @@ with gr.Blocks(
                     index_info_btn.click(refresh_info, outputs=index_info_display)
                     demo.load(refresh_info, outputs=index_info_display)  # 页面加载时自动刷新
 
-                    # 🌟 新增：联网搜索控制面板
+                    # 🌐 联网搜索控制面板
                     gr.Markdown("---")
                     gr.Markdown("### 🌐 联网搜索设置")
                     
                     web_search_toggle = gr.Checkbox(
-                        label="启用联网搜索 (知识库无答案时自动联网)",
+                        label="启用联网搜索",
                         value=True,
+                        interactive=True,
+                    )
+                    
+
+
+                    # 🌟 新增：搜索引擎下拉选择
+                    search_provider_dropdown = gr.Dropdown(
+                        label="搜索引擎",
+                        choices=["tavily", "bing", "duckduckgo"],
+                        value=config.SEARCH_PROVIDER,
                         interactive=True,
                     )
                     
                     relevance_slider = gr.Slider(
                         label="相关性阈值 (越低越容易触发联网)",
-                        minimum=-2.0,
+                        minimum=-5.0,
                         maximum=5.0,
-                        value=0.3,
+                        value=0.0,
                         step=0.1,
                         interactive=True,
                     )
                     
                     def toggle_web_search(enabled):
                         engine.web_search_enabled = enabled
-                        return f"{'✅ 联网搜索已启用' if enabled else '❌ 联网搜索已禁用'}"
+                        status = f"{'✅ 联网搜索已启用' if enabled else '❌ 联网搜索已禁用'}"
+                        if enabled:
+                            status += f"\n当前引擎: **{engine.search_provider.upper()}**"
+                        return status
                     
                     def update_threshold(value):
                         engine.relevance_threshold = value
-                        return f"✅ 相关性阈值已更新为: {value}"
+                        return f"✅ 相关性阈值: {value}"
                     
-                    web_search_status = gr.Markdown("✅ 联网搜索已启用")
-                    web_search_toggle.change(fn=toggle_web_search, inputs=[web_search_toggle], outputs=[web_search_status])
-                    relevance_slider.change(fn=update_threshold, inputs=[relevance_slider], outputs=[web_search_status])
+                    def switch_provider(provider):
+                        msg = engine.switch_search_provider(provider)
+                        return msg
+                    
+                    web_search_status = gr.Markdown(
+                        f"✅ 联网搜索已启用\n当前引擎: **{config.SEARCH_PROVIDER.upper()}**"
+                    )
+                    
+                    web_search_toggle.change(
+                        fn=toggle_web_search, 
+                        inputs=[web_search_toggle], 
+                        outputs=[web_search_status]
+                    )
+                    relevance_slider.change(
+                        fn=update_threshold, 
+                        inputs=[relevance_slider], 
+                        outputs=[web_search_status]
+                    )
+                    # 🌟 绑定切换事件
+                    search_provider_dropdown.change(
+                        fn=switch_provider,
+                        inputs=[search_provider_dropdown],
+                        outputs=[web_search_status]
+                    )
+
+
 
 
                     # 🌟 新增：清空 RAG 记忆按钮
