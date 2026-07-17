@@ -648,14 +648,29 @@ class RAGEngine:
         1. include_answer=True 时，会返回一个 AI 生成的摘要答案
         2. 返回的 content 是清洗过的核心文本，可直接喂给 LLM
         3. search_depth="advanced" 会进行更深度的内容提取
+
+        4. 增加 Tavily 搜索实现 (增强版：支持 AI 摘要答案)
         """
         logger.info(f"🔍 [Tavily] 正在搜索: {query}")
         
-        # TavilySearchResults.invoke 返回列表
-        raw_results = self.web_search_tool.invoke(query)
+        from tavily import TavilyClient
+
+        # 🌟 使用 TavilyClient 直接调用，可以获取 answer
+        client = TavilyClient(api_key=config.TAVILY_API_KEY)
+        response = client.search(
+            query=query,
+            max_results=5,
+            search_depth="advanced",
+            include_answer=True,        # 🌟 获取 AI 摘要答案
+            include_raw_content=False,
+            include_images=False,
+        )
+        
+        # 🌟 保存 AI 摘要答案 (供前端展示)
+        self._tavily_answer = response.get("answer", "")
         
         formatted = []
-        for r in raw_results:
+        for r in response.get("results", []):
             formatted.append({
                 "title": r.get("title", "无标题"),
                 "snippet": r.get("content", "无摘要"),  # 🌟 Tavily 的 content 是清洗过的核心内容
@@ -665,6 +680,9 @@ class RAGEngine:
             })
         
         logger.info(f"✅ [Tavily] 搜索完成，获取 {len(formatted)} 条结果")
+        if self._tavily_answer:
+            logger.info(f"💡 [Tavily] AI 摘要: {self._tavily_answer[:100]}...")
+
         return formatted
     
     def _duckduckgo_search(self, query: str) -> list[dict]:
