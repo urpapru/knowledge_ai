@@ -82,10 +82,12 @@ import json
 
 # Tavily
 try:
-    from langchain_community.tools.tavily_search import TavilySearchResults
+    # from langchain_community.tools.tavily_search import TavilySearchResults
+    from langchain_tavily import TavilySearch
     TAVILY_AVAILABLE = True
 except ImportError:
     TAVILY_AVAILABLE = False
+
 
 # DuckDuckGo (保留作为备选)
 try:
@@ -184,12 +186,11 @@ class RAGEngine:
         # except Exception as e:
         #     logger.warning(f"⚠️ 联网搜索工具初始化失败: {e}，将禁用联网功能")
         #     self.web_search_enabled = False
-
         # ==========================================
         # 🌐 联网搜索初始化 (多引擎支持)
         # ==========================================
         self.web_search_enabled = True
-        self.relevance_threshold = 0.0  # bge-reranker-base 建议阈值
+        self.relevance_threshold = 0.3  # bge-reranker-base 建议阈值
         self.web_search_tool = None
         self.search_provider = config.SEARCH_PROVIDER  # 从配置读取
         
@@ -212,19 +213,21 @@ class RAGEngine:
                 self.web_search_enabled = False
                 return
             
-            api_key = getattr(config, 'TAVILY_API_KEY', '')
-            if not api_key or api_key == "tvly-你的Key":
-                logger.error("❌ 请在 config.py 中设置 TAVILY_API_KEY")
-                self.web_search_enabled = False
-                return
-            
+            # 改成了.env 文件写 TAVILY_API_KEY=tvly-xxx , config.py 用 os.getenv("TAVILY_API_KEY")
+            # api_key = getattr(config, 'TAVILY_API_KEY', '')
+            # logger.info(f"秘钥: {api_key}")
+            # if not api_key or api_key == "tvly-你的Key":
+            #     logger.error("❌ 请在 config.py 中设置 TAVILY_API_KEY")
+            #     self.web_search_enabled = False
+            #     return
             try:
-                self.web_search_tool = TavilySearchResults(
-                    max_results=5,
+                self.web_search_tool = TavilySearch(
+                    max_results=10,           # 🌟 从 5 改成 10，召回更多结果
                     search_depth="advanced",  # 🌟 深度搜索，质量更高 (消耗更多 API 额度)
                     include_answer=True,       # 🌟 让 Tavily 直接生成一个 AI 摘要答案
                     include_raw_content=False, # 不返回原始网页内容 (节省 Token)
                     include_images=False,      # 不返回图片
+                    # tavily_api_key=api_key,  # 🌟 直接告诉它！不需要绕道环境变量
                 )
                 logger.info("✅ Tavily 联网搜索引擎初始化成功 🚀")
             except Exception as e:
@@ -250,7 +253,7 @@ class RAGEngine:
             
             try:
                 self.web_search_tool = DuckDuckGoSearchAPIWrapper(
-                    max_results=5,
+                    max_results=10,   # 🌟 从 5 改成 10，召回更多结果
                     region="cn-zh",
                     backend="text",
                 )
@@ -657,15 +660,20 @@ class RAGEngine:
         from tavily import TavilyClient
 
         # 🌟 使用 TavilyClient 直接调用，可以获取 answer
-        client = TavilyClient(api_key=config.TAVILY_API_KEY)
+        # client = TavilyClient(api_key=config.TAVILY_API_KEY) # 使用.env文件传入，这里不需要再次传入
+        client = TavilyClient()
         response = client.search(
             query=query,
-            max_results=5,
+            max_results=10,             # 🌟 从 5 改成 10，召回更多结果
             search_depth="advanced",
             include_answer=True,        # 🌟 获取 AI 摘要答案
             include_raw_content=False,
             include_images=False,
+            # 🌟 加上这个参数，让 Tavily 搜索更多相关主题
+            topic="general",
         )
+        raw_results = response.get("results", [])
+        logger.info(f"🔍 Tavily 原始返回数量: {len(raw_results)}") # 🌟 打印原始数量
         
         # 🌟 保存 AI 摘要答案 (供前端展示)
         self._tavily_answer = response.get("answer", "")
@@ -774,7 +782,7 @@ class RAGEngine:
         
         # 🌟 关键修复：DuckDuckGoSearchAPIWrapper.results() 直接返回 list[dict]
         # 每个 dict 包含: title, link, snippet
-        raw_results = self.web_search_tool.results(query, max_results=5)
+        raw_results = self.web_search_tool.results(query, max_results=10)
         
         
         # 只需要检查是否为空列表
