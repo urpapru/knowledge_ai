@@ -75,9 +75,24 @@ from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
 from langchain_core.documents import Document
 
 import config
-
 logger = logging.getLogger(__name__)
 
+# 🌐 联网搜索 - 多引擎支持
+import json
+
+# Tavily
+try:
+    from langchain_community.tools.tavily_search import TavilySearchResults
+    TAVILY_AVAILABLE = True
+except ImportError:
+    TAVILY_AVAILABLE = False
+
+# DuckDuckGo (保留作为备选)
+try:
+    from langchain_community.tools import DuckDuckGoSearchResults
+    DDG_AVAILABLE = True
+except ImportError:
+    DDG_AVAILABLE = False
 
 class RAGEngine:
     """个人知识库 RAG 引擎"""
@@ -158,16 +173,27 @@ class RAGEngine:
         # 初始化 DuckDuckGo 搜索工具
         # max_results: 返回结果数量
         # region: 搜索区域 (cn-zh 表示中国中文)
-        try:
-            self.web_search_tool = DuckDuckGoSearchAPIWrapper(
-                max_results=5,
-                region="cn-zh",  # 中文搜索结果
-                backend="text",  # 文本搜索 (非新闻)
-            )
-            logger.info("✅ DuckDuckGo 联网搜索工具初始化成功")
-        except Exception as e:
-            logger.warning(f"⚠️ 联网搜索工具初始化失败: {e}，将禁用联网功能")
-            self.web_search_enabled = False
+        # try:
+        #     self.web_search_tool = DuckDuckGoSearchAPIWrapper(
+        #         max_results=5,
+        #         region="cn-zh",  # 中文搜索结果
+        #         backend="text",  # 文本搜索 (非新闻)
+        #     )
+        #     logger.info("✅ DuckDuckGo 联网搜索工具初始化成功")
+        # except Exception as e:
+        #     logger.warning(f"⚠️ 联网搜索工具初始化失败: {e}，将禁用联网功能")
+        #     self.web_search_enabled = False
+
+        # ==========================================
+        # 🌐 联网搜索初始化 (多引擎支持)
+        # ==========================================
+        self.web_search_enabled = True
+        self.relevance_threshold = 0.0  # bge-reranker-base 建议阈值
+        self.web_search_tool = None
+        self.search_provider = config.SEARCH_PROVIDER  # 从配置读取
+        
+        self._init_web_search_tool()
+
      
     def _get_qa_session_history(self, session_id: str) -> BaseChatMessageHistory:
         """获取 RAG 问答的 session 历史"""
