@@ -685,6 +685,85 @@ class RAGEngine:
 
         return formatted
     
+    def _bing_search(self, query: str) -> list[dict]:
+        """
+        🌟 Bing Search API 搜索实现
+        
+        Bing 的核心优势：
+        1. 微软官方搜索索引，质量最高
+        2. 中文搜索效果远优于 DuckDuckGo
+        3. 返回结构化数据 (网页摘要、日期、语言等)
+        
+        API 文档: https://learn.microsoft.com/en-us/bing/search-apis/bing-web-search/
+        """
+        import requests
+        
+        logger.info(f"🔍 [Bing] 正在搜索: {query}")
+        
+        subscription_key = config.BING_SUBSCRIPTION_KEY
+        search_url = config.BING_SEARCH_URL
+        
+        headers = {"Ocp-Apim-Subscription-Key": subscription_key}
+        params = {
+            "q": query,
+            "count": 5,               # 返回结果数量
+            "textDecorations": True,   # 启用文本装饰 (高亮匹配词)
+            "textFormat": "HTML",      # 返回 HTML 格式
+            "mkt": "zh-CN",           # 🌟 中国中文市场 (返回中文结果)
+            "setLang": "zh-Hans",     # 简体中文
+        }
+        
+        try:
+            response = requests.get(search_url, headers=headers, params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            
+            formatted = []
+            
+            # 🌟 Bing 的搜索结果在 webPages.value 中
+            web_pages = data.get("webPages", {}).get("value", [])
+            
+            for page in web_pages:
+                # 清理 HTML 标签
+                snippet = page.get("snippet", "")
+                snippet = self._strip_html_tags(snippet)
+                
+                formatted.append({
+                    "title": self._strip_html_tags(page.get("name", "无标题")),
+                    "snippet": snippet,
+                    "url": page.get("url", ""),
+                    "source": "🌐 Bing 搜索",
+                    "date": page.get("dateLastCrawled", ""),  # 🌟 Bing 提供网页最后更新时间
+                    "language": page.get("language", ""),
+                })
+            
+            logger.info(f"✅ [Bing] 搜索完成，获取 {len(formatted)} 条结果")
+            return formatted
+            
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 401:
+                logger.error("❌ [Bing] API Key 无效或已过期！请检查 config.py")
+            elif e.response.status_code == 403:
+                logger.error("❌ [Bing] 免费额度已用完 (1000次/月)")
+            elif e.response.status_code == 429:
+                logger.error("❌ [Bing] 请求过于频繁 (限制 3次/秒)")
+            else:
+                logger.error(f"❌ [Bing] HTTP 错误: {e}")
+            return []
+        except requests.exceptions.Timeout:
+            logger.error("❌ [Bing] 请求超时 (10秒)")
+            return []
+        except Exception as e:
+            logger.error(f"❌ [Bing] 搜索异常: {e}")
+            return []
+    
+    @staticmethod
+    def _strip_html_tags(text: str) -> str:
+        """清理 HTML 标签"""
+        import re
+        clean = re.sub(r'<[^>]+>', '', text)
+        clean = re.sub(r'\s+', ' ', clean).strip()
+        return clean
     def _duckduckgo_search(self, query: str) -> list[dict]:
         """DuckDuckGo 搜索实现 (免费备选)"""
         logger.info(f"🔍 [DuckDuckGo] 正在搜索: {query}")
@@ -1010,7 +1089,7 @@ class RAGEngine:
                 tavily_answer = getattr(self, '_tavily_answer', '')
                 if tavily_answer and self.search_provider == "tavily":
                     yield f"💡 **Tavily AI 快速摘要**: {tavily_answer}\n\n"
-                    
+
                 self._last_query_meta["used_web_search"] = True
                 self._last_query_meta["web_results"] = web_results
                 
