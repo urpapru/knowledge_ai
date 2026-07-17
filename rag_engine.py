@@ -1006,6 +1006,11 @@ class RAGEngine:
                 yield "🔍 *知识库未找到相关内容，正在联网搜索...*\n\n"
                 
                 web_results = self.web_search(question)
+                # 🌟 如果使用 Tavily，显示 AI 快速摘要
+                tavily_answer = getattr(self, '_tavily_answer', '')
+                if tavily_answer and self.search_provider == "tavily":
+                    yield f"💡 **Tavily AI 快速摘要**: {tavily_answer}\n\n"
+                    
                 self._last_query_meta["used_web_search"] = True
                 self._last_query_meta["web_results"] = web_results
                 
