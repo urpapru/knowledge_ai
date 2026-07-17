@@ -568,52 +568,123 @@ class RAGEngine:
             # # 打分失败时，应该触发联网搜索，而不是假装命中
             return -1.0   # 而不是 0.5  
         
-    def web_search(self, query: str) -> list[dict]:
-        """
-        🌐 执行联网搜索
+    # def web_search(self, query: str) -> list[dict]:
+    #     """
+    #     🌐 执行联网搜索
         
-        返回: [{"title": "xxx", "snippet": "xxx", "url": "xxx"}, ...]
-        """
-        if not self.web_search_enabled or not self.web_search_tool:
-            return []
+    #     返回: [{"title": "xxx", "snippet": "xxx", "url": "xxx"}, ...]
+    #     """
+    #     if not self.web_search_enabled or not self.web_search_tool:
+    #         return []
         
-        try:
-            logger.info(f"🔍 正在联网搜索: {query}")
+    #     try:
+    #         logger.info(f"🔍 正在联网搜索: {query}")
             
-            # DuckDuckGoSearchResults.invoke 返回的是 JSON 字符串
-            # raw_results = self.web_search_tool.invoke(query)
+    #         # DuckDuckGoSearchResults.invoke 返回的是 JSON 字符串
+    #         # raw_results = self.web_search_tool.invoke(query)
 
-            # 🌟 关键修复：DuckDuckGoSearchAPIWrapper.results() 直接返回 list[dict]
-            # 每个 dict 包含: title, link, snippet
-            raw_results = self.web_search_tool.results(query, max_results=5)
+    #         # 🌟 关键修复：DuckDuckGoSearchAPIWrapper.results() 直接返回 list[dict]
+    #         # 每个 dict 包含: title, link, snippet
+    #         raw_results = self.web_search_tool.results(query, max_results=5)
             
             
-            # 只需要检查是否为空列表
-            if not raw_results:
-                logger.warning("⚠️ 联网搜索返回空结果")
-                return []
+    #         # 只需要检查是否为空列表
+    #         if not raw_results:
+    #             logger.warning("⚠️ 联网搜索返回空结果")
+    #             return []
             
-            logger.info(f"🔍 原始搜索结果类型: {type(raw_results)}, 数量: {len(raw_results)}")
+    #         logger.info(f"🔍 原始搜索结果类型: {type(raw_results)}, 数量: {len(raw_results)}")
             
 
                 
             
-            # 标准化格式
-            formatted = []
-            for r in raw_results:
-                formatted.append({
-                    "title": r.get("title", "无标题"),
-                    "snippet": r.get("snippet", r.get("body", "无摘要")),
-                    "url": r.get("link", r.get("url", "")),
-                    "source": "🌐 联网搜索"
-                })
+    #         # 标准化格式
+    #         formatted = []
+    #         for r in raw_results:
+    #             formatted.append({
+    #                 "title": r.get("title", "无标题"),
+    #                 "snippet": r.get("snippet", r.get("body", "无摘要")),
+    #                 "url": r.get("link", r.get("url", "")),
+    #                 "source": "🌐 联网搜索"
+    #             })
             
-            logger.info(f"✅ 联网搜索完成，获取 {len(formatted)} 条结果")
-            return formatted
+    #         logger.info(f"✅ 联网搜索完成，获取 {len(formatted)} 条结果")
+    #         return formatted
             
-        except Exception as e:
-            logger.error(f"❌ 联网搜索失败: {e}")
+    #     except Exception as e:
+    #         logger.error(f"❌ 联网搜索失败: {e}")
+    #         return []
+
+    def web_search(self, query: str) -> list[dict]:
+        """
+        🌐 统一联网搜索入口 (自动路由到对应搜索引擎)
+        
+        返回统一格式: [{"title": "xxx", "snippet": "xxx", "url": "xxx"}, ...]
+        """
+        if not self.web_search_enabled or not self.web_search_tool:
             return []
+        
+        provider = self.search_provider.lower()
+        
+        try:
+            if provider == "tavily":
+                return self._tavily_search(query)
+            elif provider == "bing":
+                return self._bing_search(query)
+            elif provider == "duckduckgo":
+                return self._duckduckgo_search(query)
+            else:
+                logger.error(f"❌ 未知搜索引擎: {provider}")
+                return []
+        except Exception as e:
+            logger.error(f"❌ 联网搜索失败 ({provider}): {e}")
+            return []
+    
+    def _tavily_search(self, query: str) -> list[dict]:
+        """
+        🌟 Tavily 搜索实现
+        
+        Tavily 的核心优势：
+        1. include_answer=True 时，会返回一个 AI 生成的摘要答案
+        2. 返回的 content 是清洗过的核心文本，可直接喂给 LLM
+        3. search_depth="advanced" 会进行更深度的内容提取
+        """
+        logger.info(f"🔍 [Tavily] 正在搜索: {query}")
+        
+        # TavilySearchResults.invoke 返回列表
+        raw_results = self.web_search_tool.invoke(query)
+        
+        formatted = []
+        for r in raw_results:
+            formatted.append({
+                "title": r.get("title", "无标题"),
+                "snippet": r.get("content", "无摘要"),  # 🌟 Tavily 的 content 是清洗过的核心内容
+                "url": r.get("url", ""),
+                "source": "🌐 Tavily 搜索",
+                "score": r.get("score", 0),  # 🌟 Tavily 提供相关性分数
+            })
+        
+        logger.info(f"✅ [Tavily] 搜索完成，获取 {len(formatted)} 条结果")
+        return formatted
+    
+    def _duckduckgo_search(self, query: str) -> list[dict]:
+        """DuckDuckGo 搜索实现 (免费备选)"""
+        logger.info(f"🔍 [DuckDuckGo] 正在搜索: {query}")
+        
+        raw_results = self.web_search_tool.invoke(query)
+        results = json.loads(raw_results) if isinstance(raw_results, str) else raw_results
+        
+        formatted = []
+        for r in results:
+            formatted.append({
+                "title": r.get("title", "无标题"),
+                "snippet": r.get("snippet", r.get("body", "无摘要")),
+                "url": r.get("link", r.get("url", "")),
+                "source": "🌐 DuckDuckGo 搜索",
+            })
+        
+        logger.info(f"✅ [DuckDuckGo] 搜索完成，获取 {len(formatted)} 条结果")
+        return formatted
 
     def _web_results_to_context(self, results: list[dict]) -> str:
         """将联网搜索结果格式化为 LLM 可读的上下文"""
