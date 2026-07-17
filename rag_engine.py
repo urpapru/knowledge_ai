@@ -462,7 +462,7 @@ class RAGEngine:
 
             # 打分失败时返回负数，触发联网搜索
             # # 打分失败时，应该触发联网搜索，而不是假装命中
-            return -1.0   # 而不是 0.5
+            return -1.0   # 而不是 0.5  
         
     def web_search(self, query: str) -> list[dict]:
         """
