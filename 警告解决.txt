@@ -8,3 +8,14 @@
                     #或者
                     from langchain.vectorstores import Chroma
         - 新的导入： from langchain_chroma import Chroma
+
+1. uv 下载警告： warning: Failed to hardlink files; falling back to full copy.
+    1. 原因
+        - uv 之所以安装速度极快，是因为它默认使用 “硬链接（hardlink）” 技术：它把下载好的包放在缓存目录，然后在你的项目目录里创建一个“快捷方式（硬链接）”指过去，而不是傻傻地把文件复制一遍。这样既不占双倍空间，安装又是秒级。
+        - 但是！你的项目路径是 D:\2023AI\...（D盘），而 uv 的默认缓存目录通常在 C:\Users\你的用户名\AppData\Local\uv\cache（C盘）。在 windows 系统中，硬链接是不允许跨盘符（跨文件系统）创建的！
+    2. 解决
+        - 方案一：把缓存目录改到 D 盘（🌟 最完美：治标又治本，保住极致速度）
+        - 在 D 盘创建一个专门放缓存的文件夹（比如 D:\.uv-cache）
+        - 设置永久系统环境变量，让 uv 以后都把缓存放这里。在 PowerShell 中执行： [Environment]::SetEnvironmentVariable("UV_CACHE_DIR", "D:\.uv-cache", "User")
+        - 重启你的 PowerShell / VSCode / PyCharm（让环境变量生效）
+        - 清理一下以前在 C 盘的旧缓存（可选，为了释放 C 盘空间）： uv cache clean

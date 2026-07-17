@@ -66,6 +66,14 @@ from langchain_community.chat_message_histories import ChatMessageHistory
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_experimental.agents.agent_toolkits import create_pandas_dataframe_agent
 
+
+# 🌟 联网搜索相关
+# （它是 Agent Tool，返回的是字符串，不是结构化数据）
+from langchain_community.tools import DuckDuckGoSearchResults
+# ✅ 换成这个（它返回结构化的 list[dict]）
+from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
+from langchain_core.documents import Document
+
 import config
 
 logger = logging.getLogger(__name__)
@@ -142,6 +150,24 @@ class RAGEngine:
         # 用于区分不同会话的 ID
         self.qa_session_id = str(uuid.uuid4())
         self.data_session_id = str(uuid.uuid4())
+
+        # 🌟 联网搜索配置
+        self.web_search_enabled = True  # 全局开关
+        self.relevance_threshold = 0.3  # 🌟 Reranker 相关性阈值 (低于此值触发联网)
+
+        # 初始化 DuckDuckGo 搜索工具
+        # max_results: 返回结果数量
+        # region: 搜索区域 (cn-zh 表示中国中文)
+        try:
+            self.web_search_tool = DuckDuckGoSearchAPIWrapper(
+                max_results=5,
+                region="cn-zh",  # 中文搜索结果
+                backend="text",  # 文本搜索 (非新闻)
+            )
+            logger.info("✅ DuckDuckGo 联网搜索工具初始化成功")
+        except Exception as e:
+            logger.warning(f"⚠️ 联网搜索工具初始化失败: {e}，将禁用联网功能")
+            self.web_search_enabled = False
      
     def _get_qa_session_history(self, session_id: str) -> BaseChatMessageHistory:
         """获取 RAG 问答的 session 历史"""
@@ -366,6 +392,139 @@ class RAGEngine:
         # 保留原有的无记忆 chain 用于 get_sources 等不需要历史的场景
         self.rag_chain = base_rag_chain
     
+    
+    def _should_use_web_search(self, question: str) -> tuple[bool, list[Document]]:
+        """
+        🌟 路由决策：判断是否需要联网搜索
+        
+        原理：
+        1. 先执行 Advanced RAG 检索（包含 Reranker）
+        2. 检查 Reranker 返回的最高分文档的相关性得分
+        3. 如果最高分 < threshold，说明知识库中没有相关内容，触发联网
+        
+        返回: (是否需要联网, 本地检索到的文档)
+        """
+        if not self.web_search_enabled or not self.advanced_retriever:
+            return False, []
+        
+        try:
+            # 执行 Advanced RAG 检索
+            docs = self.advanced_retriever.invoke(question)
+            
+            if not docs:
+                logger.info("🌐 知识库无相关文档，触发联网搜索")
+                return True, []
+            
+            # 🌟 关键：检查 Reranker 的相关性得分
+            # Cross-Encoder (bge-reranker) 的输出分数通常在 -10 ~ 10 之间
+            # 经过实际测试，阈值设为 0.0 ~ 1.0 之间比较合理
+            # 如果你的 Reranker 是 bge-reranker-base，建议阈值 0.0
+            top_score = self._get_reranker_score(question, docs[0])
+            
+            # 🌟 新增：如果打分失败（返回负数），直接触发联网
+            if top_score < 0:
+                logger.info("🌐 Reranker 打分异常，安全起见触发联网搜索")
+                return True, docs
+        
+            logger.info(f"📊 Reranker 最高分: {top_score:.4f} (阈值: {self.relevance_threshold})")
+            
+            if top_score < self.relevance_threshold:
+                logger.info(f"🌐 知识库相关性不足 ({top_score:.4f} < {self.relevance_threshold})，触发联网搜索")
+                return True, docs  # 即使触发联网，也返回本地文档作为补充
+            
+            logger.info(f"📚 知识库命中 ({top_score:.4f} >= {self.relevance_threshold})，使用本地知识")
+            return False, docs
+            
+        except Exception as e:
+            logger.warning(f"⚠️ 路由决策异常: {e}，降级为本地检索")
+            return False, []
+
+    def _get_reranker_score(self, question: str, doc: Document) -> float:
+        """
+        获取 Reranker 对单个文档的打分
+        使用 CrossEncoder 直接计算 query-document 相关性
+        """
+        if not self.cross_encoder:
+            # 如果没有 Reranker，返回负数触发联网搜索,或者给一个默认中等分数（不触发联网）
+            # 没有 Reranker 时，应该返回一个会触发联网的分数
+            return -1.0 # 而不是 0.5
+        
+        try:
+            # CrossEncoder.predict 返回相关性分数列表
+            # scores = self.cross_encoder.predict([(question, doc.page_content)])
+            # 🌟 关键修复：langchain 的 HuggingFaceCrossEncoder 使用 score 方法
+            text_pairs = [(question, doc.page_content)]
+            scores = self.cross_encoder.score(text_pairs)
+            # scores 是一个列表，取第一个元素
+            return float(scores[0])
+        except Exception as e:
+            logger.warning(f"⚠️ Reranker 打分失败: {e}")
+
+            # 打分失败时返回负数，触发联网搜索
+            # # 打分失败时，应该触发联网搜索，而不是假装命中
+            return -1.0   # 而不是 0.5
+        
+    def web_search(self, query: str) -> list[dict]:
+        """
+        🌐 执行联网搜索
+        
+        返回: [{"title": "xxx", "snippet": "xxx", "url": "xxx"}, ...]
+        """
+        if not self.web_search_enabled or not self.web_search_tool:
+            return []
+        
+        try:
+            logger.info(f"🔍 正在联网搜索: {query}")
+            
+            # DuckDuckGoSearchResults.invoke 返回的是 JSON 字符串
+            # raw_results = self.web_search_tool.invoke(query)
+
+            # 🌟 关键修复：DuckDuckGoSearchAPIWrapper.results() 直接返回 list[dict]
+            # 每个 dict 包含: title, link, snippet
+            raw_results = self.web_search_tool.results(query, max_results=5)
+            
+            
+            # 只需要检查是否为空列表
+            if not raw_results:
+                logger.warning("⚠️ 联网搜索返回空结果")
+                return []
+            
+            logger.info(f"🔍 原始搜索结果类型: {type(raw_results)}, 数量: {len(raw_results)}")
+            
+
+                
+            
+            # 标准化格式
+            formatted = []
+            for r in raw_results:
+                formatted.append({
+                    "title": r.get("title", "无标题"),
+                    "snippet": r.get("snippet", r.get("body", "无摘要")),
+                    "url": r.get("link", r.get("url", "")),
+                    "source": "🌐 联网搜索"
+                })
+            
+            logger.info(f"✅ 联网搜索完成，获取 {len(formatted)} 条结果")
+            return formatted
+            
+        except Exception as e:
+            logger.error(f"❌ 联网搜索失败: {e}")
+            return []
+
+    def _web_results_to_context(self, results: list[dict]) -> str:
+        """将联网搜索结果格式化为 LLM 可读的上下文"""
+        if not results:
+            return ""
+        
+        formatted = []
+        for i, r in enumerate(results, 1):
+            formatted.append(
+                f"### [联网来源 {i}] 🌐 {r['title']}\n"
+                f"链接: {r['url']}\n"
+                f"内容: {r['snippet']}"
+            )
+        return "\n\n---\n\n".join(formatted)    
+        
     def _format_docs(self, docs: list[Document]) -> str:
         """格式化检索到的文档"""
         formatted = []
@@ -585,26 +744,143 @@ class RAGEngine:
             return "⚠️ 知识库尚未构建索引！请先上传文档。"
         return self.rag_chain.invoke(question)
     
+    # def query_stream(self, question: str):
+    #     """提问（带记忆的流式输出）"""
+    #     if not self.rag_chain or self.rag_chain_with_history is None:
+    #         yield "⚠️ 知识库尚未构建索引！请先上传文档。"
+    #         return
+        
+    #     # 🌟 传入 session_id 配置
+    #     config = {"configurable": {"session_id": self.qa_session_id}}
+
+    #     try:
+    #         # 调用带记忆的 chain 进行流式输出
+    #         for chunk in self.rag_chain_with_history.stream(
+    #             {"question": question}, 
+    #             config=config
+    #         ):
+    #             yield chunk
+    #     except Exception as e:
+    #         logger.error(f"❌ 流式问答失败: {e}")
+    #         yield f"\n\n❌ 回答出错: {str(e)}"
+
     def query_stream(self, question: str):
-        """提问（带记忆的流式输出）"""
-        if not self.rag_chain or self.rag_chain_with_history is None:
+        """
+        🌟 带记忆 + 联网增强的流式问答
+        
+        决策流程：
+        1. 先判断知识库是否有相关内容
+        2. 如果有 → 使用本地知识回答
+        3. 如果没有 → 联网搜索，用搜索结果回答
+        4. 混合模式 → 本地知识 + 联网结果一起喂给 LLM
+        """
+        if not self.advanced_retriever:
             yield "⚠️ 知识库尚未构建索引！请先上传文档。"
             return
         
-        # 🌟 传入 session_id 配置
-        config = {"configurable": {"session_id": self.qa_session_id}}
-
+        # 存储本次问答的元信息（供前端展示）
+        self._last_query_meta = {
+            "used_web_search": False,
+            "web_results": [],
+            "local_sources": [],
+            "route_decision": ""
+        }
+        
         try:
-            # 调用带记忆的 chain 进行流式输出
-            for chunk in self.rag_chain_with_history.stream(
-                {"question": question}, 
-                config=config
-            ):
+            # 🌟 Step 1: 路由决策
+            use_web, local_docs = self._should_use_web_search(question)
+            
+            # 记录本地来源
+            self._last_query_meta["local_sources"] = [
+                {
+                    "source": doc.metadata.get("source", "未知"),
+                    "filename": Path(doc.metadata.get("source", "")).name,
+                    "content_preview": doc.page_content[:200],
+                }
+                for doc in local_docs
+            ]
+            
+            # 🌟 Step 2: 构建上下文
+            context_parts = []
+            
+            if local_docs and not use_web:
+                # 情况 A: 纯本地知识
+                context_parts.append("【知识库内容】\n" + self._format_docs(local_docs))
+                self._last_query_meta["route_decision"] = "📚 使用知识库回答"
+                
+            elif use_web:
+                # 情况 B/C: 需要联网搜索
+                yield "🔍 *知识库未找到相关内容，正在联网搜索...*\n\n"
+                
+                web_results = self.web_search(question)
+                self._last_query_meta["used_web_search"] = True
+                self._last_query_meta["web_results"] = web_results
+                
+                if web_results:
+                    web_context = self._web_results_to_context(web_results)
+                    context_parts.append("【联网搜索结果】\n" + web_context)
+                    
+                    # 如果本地也有一些相关文档，作为补充
+                    if local_docs:
+                        context_parts.append("【知识库补充内容】\n" + self._format_docs(local_docs))
+                        self._last_query_meta["route_decision"] = "🌐 联网搜索 + 知识库补充"
+                    else:
+                        self._last_query_meta["route_decision"] = "🌐 纯联网搜索回答"
+                else:
+                    # 联网也失败了，降级为本地
+                    if local_docs:
+                        context_parts.append("【知识库内容（联网搜索失败，降级使用）】\n" + self._format_docs(local_docs))
+                    else:
+                        yield "😔 抱歉，知识库和联网搜索均未找到相关内容。请尝试换一种问法。"
+                        return
+            
+            # 🌟 Step 3: 构建带联网上下文的 Prompt
+            full_context = "\n\n".join(context_parts)
+            
+            # 使用专门的联网+知识库 Prompt
+            web_aware_prompt = ChatPromptTemplate.from_messages([
+                ("system", 
+                 config.SYSTEM_PROMPT + 
+                 "\n\n请参考以下上下文信息来回答用户的问题。\n"
+                 "如果上下文中包含【联网搜索结果】，请在回答中注明信息来源链接。\n"
+                 "如果知识库和联网搜索都没有相关信息，请诚实说明你不知道。\n\n"
+                 "上下文:\n{context}"
+                ),
+                MessagesPlaceholder(variable_name="chat_history"),
+                ("human", "{question}"),
+            ])
+            
+            # 🌟 Step 4: 构建并执行 Chain
+            temp_chain = (
+                web_aware_prompt
+
+                | self.llm
+                | StrOutputParser()
+            )
+            
+            # 获取历史
+            history = self._get_qa_session_history(self.qa_session_id).messages
+            
+            for chunk in temp_chain.stream({
+                "question": question,
+                "context": full_context,
+                "chat_history": history,
+            }):
                 yield chunk
+                
         except Exception as e:
             logger.error(f"❌ 流式问答失败: {e}")
             yield f"\n\n❌ 回答出错: {str(e)}"
 
+    # 供前端获取元信息
+    def get_last_query_meta(self) -> dict:
+        """获取上一次问答的路由决策和来源信息"""
+        return getattr(self, '_last_query_meta', {
+            "used_web_search": False,
+            "web_results": [],
+            "local_sources": [],
+            "route_decision": "未知"
+        })
     
     def get_sources(self, question: str) -> list[dict]:
         """获取问题相关的文档来源"""

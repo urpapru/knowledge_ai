@@ -25,35 +25,78 @@ engine = RAGEngine()
 #                         功能函数
 # ===================================================================
 
+# def chat_fn(message: str, history: list) -> str:
+#     """聊天处理（带记忆的流式）"""
+#     if not message.strip():
+#         return ""
+    
+#     response = ""
+#     # 1. 流式接收回答
+#     for chunk in engine.query_stream(message):
+#         response += chunk
+#         # 注意：Gradio 的 ChatInterface 会自动处理流式 yield，
+#         # 但这里我们为了最后统一拼接来源，选择先攒齐再返回。
+#         # 如果想实现真正的逐字打字机效果，需要改用 gr.Chatbot 配合 yield。
+
+#     # 2. 🌟 核心：流式结束后，手动将本轮对话写入后端 Memory！
+#     # 剔除可能包含在 response 中的来源信息，只保留纯 AI 回答写入记忆
+#     pure_ai_response = response.split("\n\n---\n📚 **参考来源:**")[0]
+#     engine.add_to_qa_memory(message, pure_ai_response)
+
+#     # 3. 附加来源信息 (UI 展示用，不写入 Memory)
+#     sources = engine.get_sources(message)
+#     if sources:
+#         response += "\n\n---\n📚 **参考来源:**\n"
+#         seen = set()
+#         for i, src in enumerate(sources, 1):
+#             if src["filename"] not in seen:
+#                 response += f"  {i}. 📄 `{src['filename']}`\n"
+#                 seen.add(src["filename"])
+    
+#     return response
+
 def chat_fn(message: str, history: list) -> str:
-    """聊天处理（带记忆的流式）"""
+    """聊天处理（带记忆 + 联网搜索的流式）"""
     if not message.strip():
         return ""
     
     response = ""
-    # 1. 流式接收回答
     for chunk in engine.query_stream(message):
         response += chunk
-        # 注意：Gradio 的 ChatInterface 会自动处理流式 yield，
-        # 但这里我们为了最后统一拼接来源，选择先攒齐再返回。
-        # 如果想实现真正的逐字打字机效果，需要改用 gr.Chatbot 配合 yield。
-
-    # 2. 🌟 核心：流式结束后，手动将本轮对话写入后端 Memory！
-    # 剔除可能包含在 response 中的来源信息，只保留纯 AI 回答写入记忆
-    pure_ai_response = response.split("\n\n---\n📚 **参考来源:**")[0]
-    engine.add_to_qa_memory(message, pure_ai_response)
-
-    # 3. 附加来源信息 (UI 展示用，不写入 Memory)
-    sources = engine.get_sources(message)
-    if sources:
-        response += "\n\n---\n📚 **参考来源:**\n"
+    
+    # 🌟 获取路由决策元信息
+    meta = engine.get_last_query_meta()
+    
+    # 🌟 在回答开头显示路由决策标识
+    route_badge = f"\n\n> {meta.get('route_decision', '📚 知识库回答')}\n"
+    
+    # 附加本地来源信息
+    local_sources = meta.get("local_sources", [])
+    if local_sources:
+        route_badge += "\n📚 **知识库来源:**\n"
         seen = set()
-        for i, src in enumerate(sources, 1):
+        for i, src in enumerate(local_sources, 1):
             if src["filename"] not in seen:
-                response += f"  {i}. 📄 `{src['filename']}`\n"
+                route_badge += f"  {i}. 📄 `{src['filename']}`\n"
                 seen.add(src["filename"])
     
-    return response
+    # 🌟 附加联网搜索来源
+    web_results = meta.get("web_results", [])
+    if web_results:
+        route_badge += "\n🌐 **联网搜索来源:**\n"
+        for i, r in enumerate(web_results[:5], 1):
+            title = r.get("title", "无标题")[:40]
+            url = r.get("url", "")
+            if url:
+                route_badge += f"  {i}. [{title}]({url})\n"
+            else:
+                route_badge += f"  {i}. {title}\n"
+    
+    # 🌟 手动写入记忆 (流式输出的标准做法)
+    pure_ai_response = response.split("\n\n---\n📚 **参考来源:**")[0]
+    engine.add_to_qa_memory(message, pure_ai_response)
+    
+    return response + route_badge
 
 def clear_rag_memory_fn():
     """清空 RAG 对话记忆"""
@@ -309,6 +352,38 @@ with gr.Blocks(
                     
                     index_info_btn.click(refresh_info, outputs=index_info_display)
                     demo.load(refresh_info, outputs=index_info_display)  # 页面加载时自动刷新
+
+                    # 🌟 新增：联网搜索控制面板
+                    gr.Markdown("---")
+                    gr.Markdown("### 🌐 联网搜索设置")
+                    
+                    web_search_toggle = gr.Checkbox(
+                        label="启用联网搜索 (知识库无答案时自动联网)",
+                        value=True,
+                        interactive=True,
+                    )
+                    
+                    relevance_slider = gr.Slider(
+                        label="相关性阈值 (越低越容易触发联网)",
+                        minimum=-2.0,
+                        maximum=5.0,
+                        value=0.3,
+                        step=0.1,
+                        interactive=True,
+                    )
+                    
+                    def toggle_web_search(enabled):
+                        engine.web_search_enabled = enabled
+                        return f"{'✅ 联网搜索已启用' if enabled else '❌ 联网搜索已禁用'}"
+                    
+                    def update_threshold(value):
+                        engine.relevance_threshold = value
+                        return f"✅ 相关性阈值已更新为: {value}"
+                    
+                    web_search_status = gr.Markdown("✅ 联网搜索已启用")
+                    web_search_toggle.change(fn=toggle_web_search, inputs=[web_search_toggle], outputs=[web_search_status])
+                    relevance_slider.change(fn=update_threshold, inputs=[relevance_slider], outputs=[web_search_status])
+
 
                     # 🌟 新增：清空 RAG 记忆按钮
                     gr.Markdown("---")
