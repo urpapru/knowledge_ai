@@ -53,3 +53,8 @@ BING_SEARCH_URL = "https://api.bing.microsoft.com/v7.0/search"
 # TAVILY_API_KEY = "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"
 
 MCP_URL = "https://mcp.tavily.com/mcp/?tavilyApiKey=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"
+
+
+# Bing 配置
+BING_SUBSCRIPTION_KEY = "你的Bing密钥"  # 替换为实际密钥
+BING_SEARCH_URL = "https://api.bing.microsoft.com/v7.0/search"
