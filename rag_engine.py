@@ -89,7 +89,8 @@ except ImportError:
 
 # DuckDuckGo (保留作为备选)
 try:
-    from langchain_community.tools import DuckDuckGoSearchResults
+    # from langchain_community.tools import DuckDuckGoSearchResults
+    from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
     DDG_AVAILABLE = True
 except ImportError:
     DDG_AVAILABLE = False
@@ -248,7 +249,7 @@ class RAGEngine:
                 return
             
             try:
-                self.web_search_tool = DuckDuckGoSearchResults(
+                self.web_search_tool = DuckDuckGoSearchAPIWrapper(
                     max_results=5,
                     region="cn-zh",
                     backend="text",
@@ -768,11 +769,23 @@ class RAGEngine:
         """DuckDuckGo 搜索实现 (免费备选)"""
         logger.info(f"🔍 [DuckDuckGo] 正在搜索: {query}")
         
-        raw_results = self.web_search_tool.invoke(query)
-        results = json.loads(raw_results) if isinstance(raw_results, str) else raw_results
+        # raw_results = self.web_search_tool.invoke(query)
+        # results = json.loads(raw_results) if isinstance(raw_results, str) else raw_results
         
+        # 🌟 关键修复：DuckDuckGoSearchAPIWrapper.results() 直接返回 list[dict]
+        # 每个 dict 包含: title, link, snippet
+        raw_results = self.web_search_tool.results(query, max_results=5)
+        
+        
+        # 只需要检查是否为空列表
+        if not raw_results:
+            logger.warning("⚠️ 联网搜索返回空结果")
+            return []
+        
+        logger.info(f"🔍 原始搜索结果类型: {type(raw_results)}, 数量: {len(raw_results)}")
+
         formatted = []
-        for r in results:
+        for r in raw_results:
             formatted.append({
                 "title": r.get("title", "无标题"),
                 "snippet": r.get("snippet", r.get("body", "无摘要")),
