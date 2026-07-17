@@ -194,7 +194,85 @@ class RAGEngine:
         
         self._init_web_search_tool()
 
-     
+    def _init_web_search_tool(self):
+        """
+        🌐 根据配置初始化对应的搜索引擎
+        
+        支持的搜索引擎:
+        - tavily: 专为 AI 设计，返回清洗后的内容 (推荐)
+        - bing: 微软必应搜索，中文质量最高
+        - duckduckgo: 免费备选
+        """
+        provider = self.search_provider.lower()
+        
+        if provider == "tavily":
+            if not TAVILY_AVAILABLE:
+                logger.error("❌ Tavily 未安装！请执行: pip install tavily-python langchain-community")
+                self.web_search_enabled = False
+                return
+            
+            api_key = getattr(config, 'TAVILY_API_KEY', '')
+            if not api_key or api_key == "tvly-你的Key":
+                logger.error("❌ 请在 config.py 中设置 TAVILY_API_KEY")
+                self.web_search_enabled = False
+                return
+            
+            try:
+                self.web_search_tool = TavilySearchResults(
+                    max_results=5,
+                    search_depth="advanced",  # 🌟 深度搜索，质量更高 (消耗更多 API 额度)
+                    include_answer=True,       # 🌟 让 Tavily 直接生成一个 AI 摘要答案
+                    include_raw_content=False, # 不返回原始网页内容 (节省 Token)
+                    include_images=False,      # 不返回图片
+                )
+                logger.info("✅ Tavily 联网搜索引擎初始化成功 🚀")
+            except Exception as e:
+                logger.error(f"❌ Tavily 初始化失败: {e}")
+                self.web_search_enabled = False
+        
+        elif provider == "bing":
+            # Bing 搜索使用自定义实现 (见下方 _bing_search 方法)
+            subscription_key = getattr(config, 'BING_SUBSCRIPTION_KEY', '')
+            if not subscription_key:
+                logger.error("❌ 请在 config.py 中设置 BING_SUBSCRIPTION_KEY")
+                self.web_search_enabled = False
+                return
+            
+            self.web_search_tool = "bing"  # 标记使用 Bing
+            logger.info("✅ Bing 联网搜索引擎初始化成功 🚀")
+        
+        elif provider == "duckduckgo":
+            if not DDG_AVAILABLE:
+                logger.error("❌ DuckDuckGo 未安装！请执行: pip install duckduckgo-search")
+                self.web_search_enabled = False
+                return
+            
+            try:
+                self.web_search_tool = DuckDuckGoSearchResults(
+                    max_results=5,
+                    region="cn-zh",
+                    backend="text",
+                )
+                logger.info("✅ DuckDuckGo 联网搜索引擎初始化成功 (免费备选)")
+            except Exception as e:
+                logger.error(f"❌ DuckDuckGo 初始化失败: {e}")
+                self.web_search_enabled = False
+        
+        else:
+            logger.warning(f"⚠️ 未知的搜索引擎: {provider}，联网搜索已禁用")
+            self.web_search_enabled = False
+    
+    def switch_search_provider(self, provider: str):
+        """
+        🔄 运行时切换搜索引擎
+        
+        Args:
+            provider: "tavily" | "bing" | "duckduckgo"
+        """
+        self.search_provider = provider
+        self._init_web_search_tool()
+        return f"✅ 搜索引擎已切换为: {provider.upper()}"
+    
     def _get_qa_session_history(self, session_id: str) -> BaseChatMessageHistory:
         """获取 RAG 问答的 session 历史"""
         if session_id not in self.qa_store:
