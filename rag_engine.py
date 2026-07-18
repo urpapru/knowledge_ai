@@ -357,10 +357,10 @@ class RAGEngine:
         history.add_user_message(user_message)
         history.add_ai_message(ai_message)
         
-        # 🌟 滑动窗口控制：只保留最近 5 轮 (10 条消息)，防止 Token 爆炸
-        # 因为 ChatMessageHistory 没有自带 k=5 功能，我们手动裁剪
-        if len(history.messages) > 10:
-            history.messages = history.messages[-10:]
+        # 🌟 滑动窗口控制：只保留最近 25 轮 (50 条消息)，防止 Token 爆炸
+        # 因为 ChatMessageHistory 没有自带 k=25 功能，我们手动裁剪
+        if len(history.messages) > 50:
+            history.messages = history.messages[-50:]
 
     
     def _build_advanced_retriever(self):
