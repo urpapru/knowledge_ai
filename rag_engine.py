@@ -366,7 +366,7 @@ class RAGEngine:
     def _build_advanced_retriever(self):
         """
         🌟 核心改造：组装 Advanced 检索器
-        流程：向量检索 + BM25 -> 混合检索 -> 多查询改写 -> 重排序
+        流程：向量检索 + BM25 → 混合检索(Ensemble) → 多查询改写(MultiQuery) → 重排序(Reranker)
         如何验证 Advanced RAG 真的生效了:
         在 Gradio 界面提问一个包含生僻专有名词的问题（比如你们公司内部的某个项目代号），观察 get_sources 返回的参考文档。
         如果是基础 RAG，它大概率会搜偏；换成 Advanced RAG 后，你会发现 BM25 会死死咬住那个专有名词，Reranker 会把最准的那条排在第一位
@@ -375,7 +375,7 @@ class RAGEngine:
             logger.warning("⚠️ 向量库或文档块为空，无法构建高级检索器")
             return
 
-        # Step A: 基础向量检索器 (召回 Top 15 供后续精排)
+        # Step A: 基础向量检索器 (召回 Top 15 供后续精排),底层检索器各召回 15 条
         vector_retriever = self.vectorstore.as_retriever(search_kwargs={"k": 15})
         
         # Step B: BM25 关键词检索器 (召回 Top 15)
@@ -487,40 +487,55 @@ class RAGEngine:
         
         返回: (是否需要联网, 本地检索到的文档)
         """
-        if not self.web_search_enabled or not self.advanced_retriever:
-            return False, []
+        # if not self.web_search_enabled or not self.advanced_retriever:
+        #     return False, [] # <--- 💥 致命陷阱在这里,结果：use_web = False，且 local_docs = []（空列表）
         
+        # 🚨 检查本地检索器是否存在（如果没有本地库，那只能看联网开关了）
+        if not self.advanced_retriever:
+            logger.warning("⚠️ 无本地知识库检索器")
+            if self.web_search_enabled:
+                return True, []  # 没本地库，但开了联网，去联网
+            else:
+                return False, [] # 没本地库，也没联网，彻底没招了
+            
+        # 🌟 核心修复：无论是否开启联网，先强制执行一次本地检索！
         try:
-            # 执行 Advanced RAG 检索
-            docs = self.advanced_retriever.invoke(question)
-            
-            if not docs:
-                logger.info("🌐 知识库无相关文档，触发联网搜索")
-                return True, []
-            
-            # 🌟 关键：检查 Reranker 的相关性得分
-            # Cross-Encoder (bge-reranker) 的输出分数通常在 -10 ~ 10 之间
-            # 经过实际测试，阈值设为 0.0 ~ 1.0 之间比较合理
-            # 如果你的 Reranker 是 bge-reranker-base，建议阈值 0.0
-            top_score = self._get_reranker_score(question, docs[0])
-            
-            # 🌟 新增：如果打分失败（返回负数），直接触发联网
-            if top_score < 0:
-                logger.info("🌐 Reranker 打分异常，安全起见触发联网搜索")
-                return True, docs
-        
-            logger.info(f"📊 Reranker 最高分: {top_score:.4f} (阈值: {self.relevance_threshold})")
-            
-            if top_score < self.relevance_threshold:
-                logger.info(f"🌐 知识库相关性不足 ({top_score:.4f} < {self.relevance_threshold})，触发联网搜索")
-                return True, docs  # 即使触发联网，也返回本地文档作为补充
-            
-            logger.info(f"📚 知识库命中 ({top_score:.4f} >= {self.relevance_threshold})，使用本地知识")
-            return False, docs
-            
+            local_docs = self.advanced_retriever.invoke(question)
+            logger.info(f"🔍 本地检索返回文档数: {len(local_docs)}") # 看看是 0 还是大于 0
         except Exception as e:
-            logger.warning(f"⚠️ 路由决策异常: {e}，降级为本地检索")
-            return False, []
+            logger.error(f"❌ 本地检索异常: {e}")
+            local_docs = []
+
+
+        # 决策分支 1：用户在前端【关闭】了联网搜索
+        if not self.web_search_enabled:
+            logger.info("🔒 联网搜索已禁用，强制仅使用本地知识库")
+            # 直接返回 False (不联网) 和 本地检索到的文档 (可能为空，但尽力了)
+            return False, local_docs
+        
+        # 决策分支 2：用户【开启】了联网搜索，根据 Reranker 分数决定
+        if not local_docs:
+            logger.info("🌐 知识库无相关文档，触发联网搜索")
+            return True, []
+        
+        # 获取 Reranker 最高分
+        # 🌟 关键：检查 Reranker 的相关性得分
+        # Cross-Encoder (bge-reranker) 的输出分数通常在 -10 ~ 10 之间
+        # 经过实际测试，阈值设为 0.0 ~ 1.0 之间比较合理
+        # 如果你的 Reranker 是 bge-reranker-base，建议阈值 0.0
+        top_score = self._get_reranker_score(question, local_docs[0])
+        # 🌟 新增 如果打分失败（返回负数），直接触发联网
+        if top_score < 0:
+            logger.info("🌐 Reranker 打分异常，安全起见触发联网搜索")
+            return True, local_docs
+        logger.info(f"📊 Reranker 最高分: {top_score:.4f} (阈值: {self.relevance_threshold})")
+
+        if top_score < self.relevance_threshold:
+            logger.info(f"🌐 知识库相关性不足 ({top_score:.4f} < {self.relevance_threshold})，触发联网搜索")
+            return True, local_docs  # 即使触发联网，也返回本地文档作为补充
+        logger.info(f"📚 知识库命中 ({top_score:.4f} >= {self.relevance_threshold})，使用本地知识")
+        return False, local_docs
+
 
     def _get_reranker_score(self, question: str, doc: Document) -> float:
         """
@@ -978,6 +993,7 @@ class RAGEngine:
         }
         
         try:
+            # 第二步：进入 query_stream
             # 🌟 Step 1: 路由决策
             use_web, local_docs = self._should_use_web_search(question)
             
@@ -993,7 +1009,8 @@ class RAGEngine:
             
             # 🌟 Step 2: 构建上下文
             context_parts = []
-            
+            # 组装上下文
+            # local_docs 是空列表 []，在 Python 中 bool([]) 是 False！
             if local_docs and not use_web:
                 # 情况 A: 纯本地知识
                 context_parts.append("【知识库内容】\n" + self._format_docs(local_docs))
