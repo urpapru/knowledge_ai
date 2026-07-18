@@ -45,15 +45,13 @@ SEARCH_PROVIDER = "tavily"  # 可选: "tavily", "bing", "duckduckgo"
 # Tavily 配置
 # TAVILY_API_KEY = "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"
 os.getenv("TAVILY_API_KEY") # 必须要在.env文件里加上TAVILY_API_KEY=tvly-xxx
+MCP_URL = "https://mcp.tavily.com/mcp/?tavilyApiKey=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"
 
 # Bing 配置 (后面会用到)
 BING_SUBSCRIPTION_KEY = ""  # 替换为你的 Bing API Key
 BING_SEARCH_URL = "https://api.bing.microsoft.com/v7.0/search"
 
 
-# TAVILY_API_KEY = "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"
-
-MCP_URL = "https://mcp.tavily.com/mcp/?tavilyApiKey=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"
 
 
 # Bing 配置
