@@ -371,7 +371,12 @@ with gr.Blocks(
                     web_search_status = gr.Markdown(
                         f"✅ 联网搜索已启用\n当前引擎: **{config.SEARCH_PROVIDER.upper()}**"
                     )
-                    
+                    # 
+                    # 第一步：前端触发:前端取消勾选 web_search_toggle，触发 toggle_web_search(False)，成功将 engine.web_search_enabled 设为 False
+                    # 第二步：进入 query_stream: use_web, local_docs = self._should_use_web_search(question)
+                    # 第三步：进入 _should_use_web_search
+                    # 第四步：回到 query_stream 组装上下文
+                    # 第五步：大模型拿到上下文
                     web_search_toggle.change(
                         fn=toggle_web_search, 
                         inputs=[web_search_toggle], 
