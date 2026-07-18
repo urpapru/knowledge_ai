@@ -8,20 +8,16 @@ from pathlib import Path
 import hashlib
 import pandas as pd
 
-from typing import List, Dict, Any
+from typing import List
 import uuid
 
-from langchain_experimental.agents.agent_toolkits import create_pandas_dataframe_agent
-from langchain_core.messages import HumanMessage, AIMessage
 
 
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-# from langchain_community.vectorstores import Chroma  # 旧的导入
 from langchain_chroma import Chroma 
 from langchain_community.document_loaders import (
     TextLoader,
     PyPDFLoader,
-    UnstructuredMarkdownLoader,
     Docx2txtLoader,  # 🌟 新增：Word 文档加载器
     DirectoryLoader,
 )
@@ -33,11 +29,8 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.documents import Document
 
 # 🌟 新增：Advanced RAG 核心组件
-# from langchain.retrievers.multi_query import MultiQueryRetriever  #  官方已经把旧代码移到了 langchain-classic 包
-# from langchain.retrievers import EnsembleRetriever, ContextualCompressionRetriever # 官方已经把旧代码移到了 langchain-classic 包
-# from langchain.retrievers.document_compressors import CrossEncoderReranker # 移动到了langchain-classic包里
+
 from langchain_community.retrievers import BM25Retriever
-# from langchain_huggingface import HuggingFaceCrossEncoder #  实际上被归类在社区包（Community） 的交叉编码器模块下
 from langchain_community.cross_encoders import HuggingFaceCrossEncoder
 
 
@@ -53,23 +46,23 @@ from langchain_classic.retrievers.document_compressors import CrossEncoderRerank
 
 # 🌟 纯 LCEL 核心组件 (完全基于 langchain-core)
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.runnables import RunnablePassthrough, RunnableParallel
-from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_core.runnables import RunnablePassthrough
 from langchain_core.chat_history import BaseChatMessageHistory
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.documents import Document
 
 # 记忆与历史
 from langchain_community.chat_message_histories import ChatMessageHistory
-
 # Agent 相关 (LangGraph)
+
 from langgraph.checkpoint.memory import MemorySaver
-from langchain_experimental.agents.agent_toolkits import create_pandas_dataframe_agent
+from langchain.agents import create_agent # 🌟 1. 新的导入路径
+from langchain.agents.middleware import ModelCallLimitMiddleware # 🌟 2. 引入生产级中间件
+from langgraph.checkpoint.memory import MemorySaver # 或 InMemorySaver
+
 
 
 # 🌟 联网搜索相关
-# （它是 Agent Tool，返回的是字符串，不是结构化数据）
-from langchain_community.tools import DuckDuckGoSearchResults
 # ✅ 换成这个（它返回结构化的 list[dict]）
 from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
 from langchain_core.documents import Document
@@ -78,8 +71,6 @@ import config
 logger = logging.getLogger(__name__)
 
 # 🌐 联网搜索 - 多引擎支持
-import json
-
 # Tavily
 try:
     # from langchain_community.tools.tavily_search import TavilySearchResults
@@ -96,6 +87,37 @@ try:
     DDG_AVAILABLE = True
 except ImportError:
     DDG_AVAILABLE = False
+
+
+# 🌟 核心：自定义一个带“清洗功能”的安全 Python 工具
+# ==========================================
+from langchain_experimental.utilities import PythonREPL
+from langchain_core.tools import tool
+python_repl = PythonREPL()
+
+@tool
+def safe_python_repl(query: str) -> str:
+    """
+    用于执行 Python 代码来分析 CSV/Excel 数据。
+    输入必须是合法的 Python 代码。支持多行代码。
+    可用变量: df (当前加载的数据框)
+    """
+    # 🌟 核心修复：清洗大模型生成的错误转义符！
+    # 把字面量 \\n 替换为真正的换行符 \n
+    clean_code = query.replace("\\n", "\n")
+    clean_code = clean_code.replace("\\\\", "\\")
+    
+    try:
+        # 将 df 注入到 REPL 的全局变量中
+        result = python_repl.run(clean_code, globals={"df": current_df, "pd": pd})
+        # 截断过长的输出，防止 Token 爆炸
+        return result[:3000] if len(result) > 3000 else result
+    except Exception as e:
+        return f"执行出错: {str(e)}"
+
+# 用于在 Tool 中引用当前的 DataFrame
+current_df = None
+
 
 class RAGEngine:
     """个人知识库 RAG 引擎"""
@@ -181,6 +203,8 @@ class RAGEngine:
         
         self._init_web_search_tool()
 
+
+
     def _init_web_search_tool(self):
         """
         🌐 根据配置初始化对应的搜索引擎
@@ -257,12 +281,7 @@ class RAGEngine:
         self.search_provider = provider
         self._init_web_search_tool()
         return f"✅ 搜索引擎已切换为: {provider.upper()}"
-    
-    def _get_qa_session_history(self, session_id: str) -> BaseChatMessageHistory:
-        """获取 RAG 问答的 session 历史"""
-        if session_id not in self.qa_store:
-            self.qa_store[session_id] = ChatMessageHistory()
-        return self.qa_store[session_id]    
+       
 
     @staticmethod
     def _format_docs(docs: List[Document]) -> str:
@@ -270,11 +289,10 @@ class RAGEngine:
         return "\n\n".join(doc.page_content for doc in docs)
 
     def chat_with_memory(self, question: str) -> dict:
-        """
-        🌟 纯 LCEL 带记忆的知识问答 (兼容 LangChain 1.x / langchain-core 1.x)
-        """
-        if not hasattr(self, 'retriever') or self.retriever is None:
-            return {"answer": "⚠️ 知识库未初始化，请先上传文档！", "sources": []}
+        
+        """非流式带记忆问答 (直接复用 self.rag_chain)"""
+        if not self.rag_chain:
+            return {"answer": "⚠️ 知识库未初始化！", "sources": []}
         
         try:
             # 1. 定义 System Prompt
@@ -284,65 +302,31 @@ class RAGEngine:
                 "保持回答简洁专业。\n\n"
                 "上下文:\n{context}"
             )
+            # 1. 获取历史
+            history = self._get_qa_session_history(self.qa_session_id)
             
-            # 2. 构建 Prompt 模板 (包含历史占位符)
-            prompt = ChatPromptTemplate.from_messages(
-                [
-                    ("system", system_prompt),
-                    MessagesPlaceholder("chat_history"), # 🌟 注入历史对话
-                    ("human", "{input}"),
-                ]
-            )
+            # 2. 调用纯净的 Chain (手动传入 history)
+            answer_text = self.rag_chain.invoke({
+                "question": question,
+                "chat_history": history.messages
+            })
+            # 3. 🌟 手动保存记忆 (因为 Chain 是纯净的，所以这里存一次刚刚好)
+            history.add_user_message(question)
+            history.add_ai_message(answer_text)
             
-            # 3. 🌟 核心：使用纯 LCEL (管道符 |) 构建 RAG Chain
-            # 输入字典: {"input": "问题", "chat_history": [历史消息]}
-            # RunnablePassthrough.assign 会保留原有的 key，并新增 "context" key
-            rag_chain = (
-                RunnablePassthrough.assign(
-                    context=lambda x: self._format_docs(self.retriever.invoke(x["input"]))
-                )
+            # 4. 滑动窗口裁剪 (保留最近 25 轮)
+            if len(history.messages) > 50:
+                history.messages = history.messages[-50:]
 
-                | prompt
-                | self.llm
-                | StrOutputParser()
-            )
+            # 5. 获取来源
+            source_docs = self.advanced_retriever.invoke(question)
+            sources = [{"content": d.page_content[:100], "source": d.metadata.get("source", "未知")} for d in source_docs]
             
-            # 4. 🌟 包裹 RunnableWithMessageHistory 实现记忆
-            rag_chain_with_history = RunnableWithMessageHistory(
-                rag_chain,
-                self._get_qa_session_history,
-                input_messages_key="input",
-                history_messages_key="chat_history",
-            )
-            
-            # 5. 执行调用 (传入 session_id)
-            config = {"configurable": {"session_id": self.qa_session_id}}
-            
-            # invoke 返回的是 StrOutputParser 解析后的纯字符串
-            answer_text = rag_chain_with_history.invoke(
-                {"input": question}, 
-                config=config
-            )
-            
-            # 6. 单独获取来源信息 (因为纯 LCEL 链最终只输出了字符串)
-            # 为了给用户展示来源，我们手动再检索一次 (或者在链中用 RunnableParallel 返回字典，但那样处理 history 会更复杂)
-            # 对于展示来源，手动检索一次是最稳妥且解耦的做法
-            source_docs = self.retriever.invoke(question)
-            sources = []
-            for doc in source_docs:
-                sources.append({
-                    "content": doc.page_content[:100] + "...",
-                    "source": doc.metadata.get("source", "未知"),
-                    "filename": doc.metadata.get("filename", "未知")
-                })
-            
-            return {
-                "answer": answer_text,
-                "sources": sources
-            }
+            return {"answer": answer_text, "sources": sources}
         except Exception as e:
             logger.error(f"❌ 问答失败: {e}")
             return {"answer": f"回答失败: {str(e)}", "sources": []}
+        
 
     def clear_qa_memory(self):
         """清空知识问答记忆 (重置 session)"""
@@ -351,7 +335,7 @@ class RAGEngine:
     
     def add_to_qa_memory(self, user_message: str, ai_message: str):
         """
-        🌟 手动将一轮对话添加到 RAG 记忆中 (专为流式输出设计)
+        🌟 手动将一轮对话添加到 RAG 记忆中 ((专供 query_stream 流式输出后调用))
         """
         history = self._get_qa_session_history(self.qa_session_id)
         history.add_user_message(user_message)
@@ -442,40 +426,39 @@ class RAGEngine:
                 self.vectorstore = None
     
     def _build_chain(self):
-        """构建 带记忆的 RAG LCEL Chain"""
+        """构建 带记忆的 RAG LCEL Chain (不带自动记忆包装) """
         if not self.advanced_retriever:
             return
         
         # 🌟 1. 重构 Prompt：注入 MessagesPlaceholder
-        # 注意：这里假设 config.SYSTEM_PROMPT 是系统提示词字符串
+        # 注意：这里 config.SYSTEM_PROMPT  是系统提示词字符串
         self.rag_prompt_with_history = ChatPromptTemplate.from_messages([
             ("system", config.SYSTEM_PROMPT + "\n\n请参考以下上下文信息:\n{context}"),
             MessagesPlaceholder(variable_name="chat_history"), # 🌟 注入历史对话
             ("human", "{question}"),
         ])
 
-        # 🌟 2. 构建基础 RAG Chain (纯 LCEL)
-        base_rag_chain = (
+        # 🌟 2. 构建纯洁的基础 RAG Chain (纯 LCEL) (不包裹 RunnableWithMessageHistory)
+        # 这样 Chain 就只负责“根据输入生成输出”，不负责“偷偷存记忆”
+        self.rag_chain = (
             RunnablePassthrough.assign(
                 context=lambda x: self._format_docs(self.advanced_retriever.invoke(x["question"]))
             )
 
-            | self.rag_prompt_with_history
+            | self.rag_prompt
             | self.llm
             | StrOutputParser()
         )
-        # 🌟 3. 核心：包裹 RunnableWithMessageHistory
-        self.rag_chain_with_history = RunnableWithMessageHistory(
-            base_rag_chain,
-            self._get_qa_session_history,
-            input_messages_key="question",
-            history_messages_key="chat_history",
-        )
+        logger.info("✅ 纯净版 RAG Chain 构建完成")
 
-        # 保留原有的无记忆 chain 用于 get_sources 等不需要历史的场景
-        self.rag_chain = base_rag_chain
     
+    def _get_qa_session_history(self, session_id: str) -> BaseChatMessageHistory:
+        """获取 RAG 问答的 session 历史"""
+        if session_id not in self.qa_store:
+            self.qa_store[session_id] = ChatMessageHistory()
+        return self.qa_store[session_id] 
     
+
     def _should_use_web_search(self, question: str) -> tuple[bool, list[Document]]:
         """
         🌟 路由决策：判断是否需要联网搜索
@@ -548,20 +531,20 @@ class RAGEngine:
             return -1.0 # 而不是 0.5
         
         try:
-            # CrossEncoder.predict 返回相关性分数列表
-            # scores = self.cross_encoder.predict([(question, doc.page_content)])
-            # 🌟 关键修复：langchain 的 HuggingFaceCrossEncoder 使用 score 方法
+            # 🌟 关键修复：langchain 的 HuggingFaceCrossEncoder 使用 score 方法  不是predict方法
             text_pairs = [(question, doc.page_content)]
             scores = self.cross_encoder.score(text_pairs)
             # scores 是一个列表，取第一个元素
             return float(scores[0])
         except Exception as e:
             logger.warning(f"⚠️ Reranker 打分失败: {e}")
-
             # 打分失败时返回负数，触发联网搜索
             # # 打分失败时，应该触发联网搜索，而不是假装命中
             return -1.0   # 而不是 0.5  
 
+
+
+    ##=================  联网搜索引擎  ========================
     def web_search(self, query: str) -> list[dict]:
         """
         🌐 统一联网搜索入口 (自动路由到对应搜索引擎)
@@ -637,6 +620,15 @@ class RAGEngine:
 
         return formatted
     
+
+    @staticmethod
+    def _strip_html_tags(text: str) -> str:
+        """清理 HTML 标签"""
+        import re
+        clean = re.sub(r'<[^>]+>', '', text)
+        clean = re.sub(r'\s+', ' ', clean).strip()
+        return clean
+    
     def _bing_search(self, query: str) -> list[dict]:
         """
         🌟 Bing Search API 搜索实现
@@ -709,13 +701,7 @@ class RAGEngine:
             logger.error(f"❌ [Bing] 搜索异常: {e}")
             return []
     
-    @staticmethod
-    def _strip_html_tags(text: str) -> str:
-        """清理 HTML 标签"""
-        import re
-        clean = re.sub(r'<[^>]+>', '', text)
-        clean = re.sub(r'\s+', ' ', clean).strip()
-        return clean
+
     def _duckduckgo_search(self, query: str) -> list[dict]:
         """DuckDuckGo 搜索实现 (免费备选)"""
         logger.info(f"🔍 [DuckDuckGo] 正在搜索: {query}")
@@ -758,6 +744,8 @@ class RAGEngine:
             )
         return "\n\n---\n\n".join(formatted)    
         
+
+
     def _format_docs(self, docs: list[Document]) -> str:
         """格式化检索到的文档"""
         formatted = []
@@ -768,6 +756,7 @@ class RAGEngine:
                 f"### [参考资料 {i}] 📄 {filename}\n{doc.page_content}"
             )
         return "\n\n---\n\n".join(formatted)
+    
     
     def load_documents(self, docs_dir: str = None) -> dict:
         """
@@ -826,7 +815,7 @@ class RAGEngine:
                 logger.warning(f"⚠️ 加载失败: {e}")
         
         if not all_docs:
-            return {"error": "未找到任何文档（支持 .txt, .pdf, .md）"}
+            return {"error": "未找到任何文档（支持 .txt, .pdf, .md,.docx）"}
         
         # 切分文档
         chunks = self.splitter.split_documents(all_docs) #  🔥 存入实例变量
@@ -851,14 +840,20 @@ class RAGEngine:
         logger.info(f"✅ 索引完成: {stats}")
         return stats
     
+
+
+
+
+
     def load_dataframe(self, file_path: str) -> dict:
         """
         加载 CSV 文件到内存，并初始化数据分析 Agent
         🌟 通用表格数据加载器：支持 CSV (.csv) 和 Excel (.xlsx, .xls)
         将数据加载到内存，并初始化 Pandas Data Agent
         """
+        global current_df # 引用全局变量
         path = Path(file_path)
-
+        
         # 🌟 移除或放宽后缀检查，因为 Gradio 临时文件可能没有 .csv 后缀
         if not path.exists():
             return {"error": f"文件不存在: 文件路径为:{file_path}"}
@@ -896,7 +891,7 @@ class RAGEngine:
 
             # 如果所有编码都失败了（理论上 latin1 不会失败，但以防万一）
             if df is None:
-                return {"error": "无法解析文件编码，请确保文件是标准的 CSV 格式 (UTF-8 或 GBK)。"}
+                return {"error": "无法解析文件编码(确保是：UTF-8 或 GBK,gb2312, latin1)。"}
 
             # 2. 基础数据清洗 (可选：去除全空的行列)
             df.dropna(how='all', inplace=True) 
@@ -904,25 +899,49 @@ class RAGEngine:
 
             # 3. 存入内存字典
             self.dataframes[path.name] = df
-            
-            # 4. 🌟 核心：创建更新 Pandas Data Agent
-            # 注意：这里必须使用支持工具调用的模型 (如 qwen-plus 或 qwen-max)
-            # allow_dangerous_code=True 是必须的，因为 Agent 需要执行 Python 代码
-            self.data_agent = create_pandas_dataframe_agent(
-                llm=self.llm,
-                df=list(self.dataframes.values()), # 可以传入多个 DataFrame
-                agent_type="openai-tools",
-                verbose=True, # 打印 AI 思考和写代码的过程
-                allow_dangerous_code=True, 
-                checkpointer=self.agent_checkpointer, # 🌟 注入 LangGraph Checkpointer
+            current_df = df  # 🌟 让 Tool 能够访问最新的 df
 
-                prefix="你是一个专业的数据分析师。你可以使用 Pandas 对提供的 DataFrame 进行数据分析。请使用中文回答。",
-            )
-            
-            # 5. 生成数据概览
+            # 🌟 4. 核心改造：使用 LangGraph 构建现代 Agent
+            # 构建系统提示词 (包含数据概览，让 LLM 知道 df 长什么样)
             rows, cols = df.shape
             columns_info = ", ".join([f"{col} ({df[col].dtype})" for col in df.columns])
-            
+            df_head = df.head(3).to_string()
+
+
+            # 🌟 5. system_prompt 直接接受纯字符串 (不再需要 SystemMessage 包装)
+            system_prompt_text = (
+                "你是一个专业的数据分析师。你可以使用 Pandas 对提供的 DataFrame (`df`) 进行数据分析。\n"
+                "请使用中文回答。在编写 Python 代码时，请直接使用变量 `df`，无需重新读取文件。\n"
+                "【重要代码格式警告】：当你调用工具执行代码时，必须确保代码中的换行符是真正的换行符，"
+                "绝对不要输出字面量 '\\n' (反斜杠+n)。\n\n"
+                f"当前数据概览:\n"
+                f"- 行数: {rows}, 列数: {cols}\n"
+                f"- 列名及类型: {columns_info}\n"
+                f"- 前3行预览:\n{df_head}"
+            )
+
+            # 初始化 LangGraph Checkpointer (现在它真的生效了！)
+            if not hasattr(self, 'agent_checkpointer') or self.agent_checkpointer is None:
+                self.agent_checkpointer = MemorySaver()
+
+            # 🌟 6. 构建生产级 Agent (引入 Middleware 中间件)
+            self.data_agent = create_agent(
+                model=self.llm,
+                tools=[safe_python_repl],
+                system_prompt=system_prompt_text, # 🌟 新版参数：直接传字符串
+                checkpointer=self.agent_checkpointer,
+                middleware=[
+                    # 🌟 生产级防护 1：限制最大模型调用次数，彻底杜绝死循环和 Token 爆炸！
+                    # 如果 Agent 陷入“思考->报错->再思考”的死循环，达到 15 次后会强制中断并返回已有结果。
+                    ModelCallLimitMiddleware(run_limit=15),
+                    
+                    # 🌟 生产级防护 2 (可选)：如果你希望长对话自动压缩，可以取消下面这行的注释
+                    # SummarizationMiddleware(max_tokens=4000), 
+                ]
+            )
+
+            logger.info("✅ 数据分析 Agent (create_agent + Middleware) 构建完成")
+
             return {
                 "status": "success",
                 "filename": path.name,
@@ -930,11 +949,12 @@ class RAGEngine:
                 "rows": rows,
                 "columns": cols,
                 "columns_info": columns_info,
-                "preview": df.head(3).to_markdown(index=False) # 预览前3行
+                "preview": df.head(3).to_markdown(index=False)
             }
         except Exception as e:
-            logger.error(f"❌ 表格数据加载失败:: {e}")
-            return {"error": f"解析失败: {str(e)}。请检查文件是否损坏或包含加密/密码"}
+            logger.error(f"❌ 表格数据加载失败: {e}")
+            return {"error": f"解析失败: {str(e)}"}
+        
 
     def query_data(self, question: str) -> str:
         """
@@ -955,6 +975,8 @@ class RAGEngine:
         except Exception as e:
             logger.error(f"❌ 数据分析失败: {e}")
             return f"分析失败: {str(e)}"
+        
+
     def clear_data_memory(self):
         """清空数据分析记忆 (重置 thread_id)"""
         self.data_session_id = str(uuid.uuid4())

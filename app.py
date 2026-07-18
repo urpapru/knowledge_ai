@@ -10,6 +10,10 @@ from pathlib import Path
 from rag_engine import RAGEngine
 import config
 
+
+import uuid
+
+
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,
@@ -69,67 +73,16 @@ def chat_fn(message: str, history: list) -> str:
     
     return response + route_badge
 
+
+
+# 🌟 清空Rag_memory记忆函数
 def clear_rag_memory_fn():
     """清空 RAG 对话记忆"""
     msg = engine.clear_qa_memory()
     return msg
 
-def clear_data_memory_fn():
-    """清空数据分析记忆"""
-    msg = engine.clear_data_memory()
-    return msg
-
-#                         功能函数补充
+#       功能函数补充透视，列举文档，上传文档，删除，清空，构建索引
 # ===================================================================
-
-def upload_data_fn(files):
-    """处理 CSV /Excel上传并加载到内存"""
-    # 在 Gradio 3.x (file_count="single") 中，files 直接是文件对象或字符串，不是列表！
-    if not files:
-        return "⚠️ 请选择 CSV/xls/xlsx 文件", ""
-    
-    # file_obj = files[0]
-    file_obj = files
-    # 🌟 核心修复：正确获取路径
-    if hasattr(file_obj, "name"):
-        # 如果是文件对象，取 .name 属性 (临时文件绝对路径)
-        file_path = file_obj.name
-    else:
-        # 如果直接是字符串路径，直接使用
-        file_path = str(file_obj)
-
-    # 调试信息：打印实际获取到的路径，方便排查
-    print(f"🔍 DEBUG: 解析到的文件路径 -> {file_path}")
-
-    if not file_path or not Path(file_path).exists():
-        return f"❌ 文件路径无效或不存在: {file_path}", ""
-
-    # 🌟 调用重构后的通用方法
-    result = engine.load_dataframe(file_path)
-
-    # # 取第一个文件
-    # file_path = files[0].name if hasattr(files[0], 'name') else files[0]
-    # result = engine.load_csv(file_path)
-    
-    if "error" in result:
-        return f"❌ 加载失败: {result['error']}", ""
-    
-    status_md = f"""
-    ### ✅ 数据加载成功！
-    - **文件名**: `{result['filename']}`
-    - **数据规模**: {result['rows']} 行 × {result['columns']} 列
-    - **字段信息**: {result['columns_info']}
-    """
-    
-    preview_md = f"### 📊 数据预览 (前 3 行)\n{result['preview']}"
-    
-    return status_md, preview_md
-
-def data_chat_fn(question: str, history: list) -> str:
-    """处理数据分析提问"""
-    if not question.strip():
-        return ""
-    return engine.query_data(question)
 
 def debug_retrieval_fn(question: str) -> tuple[str, str, str, str]:
     """
@@ -255,6 +208,130 @@ def build_index_fn(docs_dir: str) -> tuple[str, str]:
     
     return status, list_documents_fn()
 
+# =====================================================
+# ==================数据分析 agnent ============
+
+def upload_data_fn(files):
+    """处理 CSV /Excel上传并加载到内存"""
+    # 在 Gradio 3.x (file_count="single") 中，files 直接是文件对象或字符串，不是列表！
+    if not files:
+        return "⚠️ 请选择 CSV/xls/xlsx 文件", ""
+    
+    # file_obj = files[0]
+    file_obj = files
+    # 🌟 核心修复：正确获取路径
+    if hasattr(file_obj, "name"):
+        # 如果是文件对象，取 .name 属性 (临时文件绝对路径)
+        file_path = file_obj.name
+    else:
+        # 如果直接是字符串路径，直接使用
+        file_path = str(file_obj)
+
+    # 调试信息：打印实际获取到的路径，方便排查
+    print(f"🔍 DEBUG: 解析到的文件路径 -> {file_path}")
+
+    if not file_path or not Path(file_path).exists():
+        return f"❌ 文件路径无效或不存在: {file_path}", ""
+
+    # 🌟 调用重构后的通用方法
+    result = engine.load_dataframe(file_path)
+
+    # # 取第一个文件
+    # file_path = files[0].name if hasattr(files[0], 'name') else files[0]
+    # result = engine.load_csv(file_path)
+    
+    if "error" in result:
+        return f"❌ 加载失败: {result['error']}", ""
+    
+    status_md = f"""
+    ### ✅ 数据加载成功！
+    - **文件名**: `{result['filename']}`
+    - **数据规模**: {result['rows']} 行 × {result['columns']} 列
+    - **字段信息**: {result['columns_info']}
+    """
+
+    preview_md = f"### 📊 数据预览 (前 3 行)\n{result['preview']}"
+    
+    return status_md, preview_md
+
+
+
+# 🌟 核心：适配 LangGraph 的流式处理函数
+# ==========================================
+def data_chat_fn(message: str, history: list):
+    """
+    处理数据分析 Agent 的流式问答
+    注意：这里假设你的 engine 实例名为 engine
+    """
+    if not hasattr(engine, 'data_agent') or engine.data_agent is None:
+        yield "⚠️ 请先在上方上传 CSV 或 Excel 文件加载数据！"
+        return
+        
+    try:
+        # 1. 确保 data_session_id 存在 (用于 LangGraph 记忆)
+        if not hasattr(engine, 'data_session_id') or not engine.data_session_id:
+            engine.data_session_id = str(uuid.uuid4())
+            
+        # 2. 配置 LangGraph 的 thread_id
+        config = {"configurable": {"thread_id": engine.data_session_id}}
+        
+        # 3. 准备输出变量
+        full_response = ""
+        is_thinking = True
+        
+        # 4. 🌟 流式调用 LangGraph Agent
+        # stream_mode="values" 会在每个节点执行完毕后返回完整的 state
+        for event in engine.data_agent.stream(
+            {"messages": [("user", message)]}, 
+            config=config,
+            stream_mode="values"
+        ):
+            # event 是一个字典，包含当前的 messages 列表
+            messages = event.get("messages", [])
+            if not messages:
+                continue
+                
+            # 取最后一条消息
+            last_msg = messages[-1]
+            
+            # 如果是 AI 消息，且有内容 (不是 Tool Call)
+            if hasattr(last_msg, 'content') and last_msg.content:
+                # 过滤掉 Agent 的内部思考过程 (通常以 "Thought:" 或类似标记开头，视模型而定)
+                # 这里我们直接输出 AI 的最终回答
+                if not hasattr(last_msg, 'tool_calls') or not last_msg.tool_calls:
+                    full_response = last_msg.content
+                    yield full_response # 🌟 实时 yield 给 Gradio 刷新界面
+                    
+        # 如果循环结束还没输出，给个兜底
+        if not full_response:
+            yield "✅ 分析完成，但未生成文本回复（可能仅执行了代码）。"
+            
+    except Exception as e:
+        logger.error(f"❌ 数据分析 Agent 执行失败: {e}")
+        yield f"\n\n❌ 分析出错: {str(e)}"
+        
+
+
+# 🌟 清空数据分析记忆函数
+# ==========================================
+def clear_data_memory_fn():
+    """重置数据分析 Agent 的 session_id，变相清空记忆"""
+    if hasattr(engine, 'data_session_id'):
+        engine.data_session_id = str(uuid.uuid4())
+        # 可选：如果需要彻底清空 LangGraph 的 MemorySaver，需要更复杂的操作
+        # 但重置 thread_id 对于用户体验来说已经足够了
+        return "✅ 数据分析记忆已清空！可以开始新的分析会话。"
+    return "⚠️ 尚未初始化数据分析 Agent。"
+
+
+
+
+
+
+
+
+
+
 
 # ===================================================================
 #                         构建 Gradio 界面
@@ -345,7 +422,7 @@ with gr.Blocks(
                     )
                     
                     relevance_slider = gr.Slider(
-                        label="相关性阈值 (越低越容易触发联网)",
+                        label="相关性阈值 (默认阈值是0.3)",
                         minimum=-5.0,
                         maximum=5.0,
                         value=0.0,
@@ -521,64 +598,7 @@ with gr.Blocks(
                     fn=build_index_fn,
                     inputs=[docs_input],
                     outputs=[build_status, doc_list_display],
-                )
-        # =====================================================
-        # Tab 5: 📈 数据分析师 (CSV)
-        # =====================================================
-        with gr.Tab("📈 数据分析师", id="data"):
-            gr.Markdown("""
-            ### 📊 AI 数据分析师
-            > 上传你的 `.csv` 或 `.xlsx/.xls` 数据文件，AI 将自动读取表结构，并允许你用自然语言进行复杂的数据分析。
-            > *注：对于 Excel 文件，AI 默认读取第一个 Sheet 页。数据仅在内存中处理，关闭页面即销毁。*
-            """)
-            
-            with gr.Row():
-                with gr.Column(scale=1):
-                    # 🌟 核心修改：扩展 file_types，修改 label
-                    data_upload = gr.File(
-                        label="上传数据文件 (支持 .csv, .xlsx, .xls)",
-                        file_count="single",
-                        file_types=[".csv", ".xlsx", ".xls"],
-                        type="filepath"  # 🌟 这一行如果没加，Gradio 3.18 就会传一个奇怪的对象过来
-                    )
-                    upload_data_btn = gr.Button("📥 加载数据", variant="primary")
-                
-                with gr.Column(scale=2):
-                    data_status = gr.Markdown("等待上传数据...")
-                    data_preview = gr.Markdown("")
-            
-            gr.Markdown("---")
-            
-            # 数据分析聊天区域
-            gr.Markdown("### 💬 向数据提问")
-            gr.Markdown("*例如：'哪个产品的销量最高？'、'计算每个月的平均增长率'、'画出销售额的折线图（如果支持）'*")
-            
-            data_chatbot = gr.ChatInterface(
-                fn=data_chat_fn,
-                # type="messages",
-                examples=[
-                    "帮我总结一下这份数据的基本信息",
-                    "找出数值最大的前 5 条记录",
-                    "按类别分组，计算每组的平均值",
-                ]
-            )
-            
-            # 绑定事件 更新函数名和组件名
-            upload_data_btn.click(
-                fn=upload_data_fn,
-                inputs=[data_upload],
-                outputs=[data_status, data_preview]
-            )
-
-            # 🌟 新增：清空 Agent 记忆按钮
-            with gr.Row():
-                clear_data_memory_btn = gr.Button("🗑️ 清空分析记忆 (重置上下文)", variant="stop", size="sm")
-                data_memory_status = gr.Markdown("")
-                
-            clear_data_memory_btn.click(
-                fn=clear_data_memory_fn, 
-                outputs=data_memory_status
-            )    
+                )  
 
 
         # =====================================================
@@ -641,6 +661,65 @@ with gr.Blocks(
             4. **定期管理文档**：及时删除过时文档，保持知识库质量
             """)
 
+
+
+        # =====================================================
+        # Tab 5: 📈 数据分析师 (CSV)
+        # =====================================================
+        with gr.Tab("📈 数据分析师", id="data"):
+            gr.Markdown("""
+            ### 📊 AI 数据分析师
+            > 上传你的 `.csv` 或 `.xlsx/.xls` 数据文件，AI 将自动读取表结构，并允许你用自然语言进行复杂的数据分析。
+            > *注：对于 Excel 文件，AI 默认读取第一个 Sheet 页。数据仅在内存中处理，关闭页面即销毁。*
+            """)
+            
+            with gr.Row():
+                with gr.Column(scale=1):
+                    # 🌟 核心修改：扩展 file_types，修改 label
+                    data_upload = gr.File(
+                        label="上传数据文件 (支持 .csv, .xlsx, .xls)",
+                        file_count="single",
+                        file_types=[".csv", ".xlsx", ".xls"],
+                        type="filepath"  # 🌟 这一行如果没加，Gradio 3.18 就会传一个奇怪的对象过来
+                    )
+                    upload_data_btn = gr.Button("📥 加载数据", variant="primary")
+                
+                with gr.Column(scale=2):
+                    data_status = gr.Markdown("等待上传数据...")
+                    data_preview = gr.Markdown("")
+            
+            gr.Markdown("---")
+            
+            # 数据分析聊天区域
+            gr.Markdown("### 💬 向数据提问")
+            gr.Markdown("*例如：'哪个产品的销量最高？'、'计算每个月的平均增长率'、'画出销售额的折线图（如果支持）'*")
+            
+            data_chatbot = gr.ChatInterface(
+                fn=data_chat_fn,
+                # type="messages",
+                examples=[
+                    "帮我总结一下这份数据的基本信息",
+                    "找出数值最大的前 5 条记录",
+                    "按类别分组，计算每组的平均值",
+                ]
+            )
+            
+            # 绑定事件 更新函数名和组件名
+            upload_data_btn.click(
+                fn=upload_data_fn,
+                inputs=[data_upload],
+                outputs=[data_status, data_preview]
+            )
+
+            # 🌟 新增：清空 Agent 记忆按钮
+            with gr.Row():
+                clear_data_memory_btn = gr.Button("🗑️ 清空分析记忆 (重置上下文)", variant="stop", size="sm")
+                data_memory_status = gr.Markdown("")
+                
+            clear_data_memory_btn.click(
+                fn=clear_data_memory_fn, 
+                outputs=data_memory_status
+            )  
 
 # ===================================================================
 #                         启动
