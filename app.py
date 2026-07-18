@@ -25,42 +25,13 @@ engine = RAGEngine()
 #                         功能函数
 # ===================================================================
 
-# def chat_fn(message: str, history: list) -> str:
-#     """聊天处理（带记忆的流式）"""
-#     if not message.strip():
-#         return ""
-    
-#     response = ""
-#     # 1. 流式接收回答
-#     for chunk in engine.query_stream(message):
-#         response += chunk
-#         # 注意：Gradio 的 ChatInterface 会自动处理流式 yield，
-#         # 但这里我们为了最后统一拼接来源，选择先攒齐再返回。
-#         # 如果想实现真正的逐字打字机效果，需要改用 gr.Chatbot 配合 yield。
-
-#     # 2. 🌟 核心：流式结束后，手动将本轮对话写入后端 Memory！
-#     # 剔除可能包含在 response 中的来源信息，只保留纯 AI 回答写入记忆
-#     pure_ai_response = response.split("\n\n---\n📚 **参考来源:**")[0]
-#     engine.add_to_qa_memory(message, pure_ai_response)
-
-#     # 3. 附加来源信息 (UI 展示用，不写入 Memory)
-#     sources = engine.get_sources(message)
-#     if sources:
-#         response += "\n\n---\n📚 **参考来源:**\n"
-#         seen = set()
-#         for i, src in enumerate(sources, 1):
-#             if src["filename"] not in seen:
-#                 response += f"  {i}. 📄 `{src['filename']}`\n"
-#                 seen.add(src["filename"])
-    
-#     return response
-
 def chat_fn(message: str, history: list) -> str:
     """聊天处理（带记忆 + 联网搜索的流式）"""
     if not message.strip():
         return ""
     
     response = ""
+    # 1. 流式接收回答
     for chunk in engine.query_stream(message):
         response += chunk
     
@@ -92,7 +63,7 @@ def chat_fn(message: str, history: list) -> str:
             else:
                 route_badge += f"  {i}. {title}\n"
     
-    # 🌟 手动写入记忆 (流式输出的标准做法)
+    # 🌟 手动写入记忆 (流式输出的标准做法) 流式结束后，手动将本轮对话写入后端 Memory！
     pure_ai_response = response.split("\n\n---\n📚 **参考来源:**")[0]
     engine.add_to_qa_memory(message, pure_ai_response)
     
