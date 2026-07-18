@@ -106,7 +106,6 @@ class RAGEngine:
             model=config.CHAT_MODEL,
             api_key=config.API_KEY,
             base_url=config.BASE_URL,
-            # temperature=0.3,  # RAG 场景用低温度，确保准确性
             temperature=0.1,  # 🔥 Advanced RAG 建议降低温度，让模型更忠实于检索内容.在 Advanced RAG 中，我们已经通过 Reranker 保证了喂给大模型的上下文是极度精准的
         )
         
@@ -173,20 +172,6 @@ class RAGEngine:
         self.web_search_enabled = True  # 全局开关
         self.relevance_threshold = 0.3  # 🌟 Reranker 相关性阈值 (低于此值触发联网)
 
-        # 初始化 DuckDuckGo 搜索工具
-        # max_results: 返回结果数量
-        # region: 搜索区域 (cn-zh 表示中国中文)
-        # try:
-        #     self.web_search_tool = DuckDuckGoSearchAPIWrapper(
-        #         max_results=5,
-        #         region="cn-zh",  # 中文搜索结果
-        #         backend="text",  # 文本搜索 (非新闻)
-        #     )
-        #     logger.info("✅ DuckDuckGo 联网搜索工具初始化成功")
-        # except Exception as e:
-        #     logger.warning(f"⚠️ 联网搜索工具初始化失败: {e}，将禁用联网功能")
-        #     self.web_search_enabled = False
-        # ==========================================
         # 🌐 联网搜索初始化 (多引擎支持)
         # ==========================================
         self.web_search_enabled = True
@@ -216,10 +201,6 @@ class RAGEngine:
             # 改成了.env 文件写 TAVILY_API_KEY=tvly-xxx , config.py 用 os.getenv("TAVILY_API_KEY")
             # api_key = getattr(config, 'TAVILY_API_KEY', '')
             # logger.info(f"秘钥: {api_key}")
-            # if not api_key or api_key == "tvly-你的Key":
-            #     logger.error("❌ 请在 config.py 中设置 TAVILY_API_KEY")
-            #     self.web_search_enabled = False
-            #     return
             try:
                 self.web_search_tool = TavilySearch(
                     max_results=10,           # 🌟 从 5 改成 10，召回更多结果
@@ -454,12 +435,6 @@ class RAGEngine:
                     self._build_advanced_retriever()
                     self._build_chain()
 
-                    # self.retriever = self.vectorstore.as_retriever(
-                    #     search_kwargs={"k": config.TOP_K}
-                    # )
-                    # self._build_chain()
-                    # logger.info(f"✅ 加载已有索引，包含 {count} 个文档块")
-
                 else:
                     self.vectorstore = None
             except Exception as e:
@@ -571,53 +546,6 @@ class RAGEngine:
             # 打分失败时返回负数，触发联网搜索
             # # 打分失败时，应该触发联网搜索，而不是假装命中
             return -1.0   # 而不是 0.5  
-        
-    # def web_search(self, query: str) -> list[dict]:
-    #     """
-    #     🌐 执行联网搜索
-        
-    #     返回: [{"title": "xxx", "snippet": "xxx", "url": "xxx"}, ...]
-    #     """
-    #     if not self.web_search_enabled or not self.web_search_tool:
-    #         return []
-        
-    #     try:
-    #         logger.info(f"🔍 正在联网搜索: {query}")
-            
-    #         # DuckDuckGoSearchResults.invoke 返回的是 JSON 字符串
-    #         # raw_results = self.web_search_tool.invoke(query)
-
-    #         # 🌟 关键修复：DuckDuckGoSearchAPIWrapper.results() 直接返回 list[dict]
-    #         # 每个 dict 包含: title, link, snippet
-    #         raw_results = self.web_search_tool.results(query, max_results=5)
-            
-            
-    #         # 只需要检查是否为空列表
-    #         if not raw_results:
-    #             logger.warning("⚠️ 联网搜索返回空结果")
-    #             return []
-            
-    #         logger.info(f"🔍 原始搜索结果类型: {type(raw_results)}, 数量: {len(raw_results)}")
-            
-
-                
-            
-    #         # 标准化格式
-    #         formatted = []
-    #         for r in raw_results:
-    #             formatted.append({
-    #                 "title": r.get("title", "无标题"),
-    #                 "snippet": r.get("snippet", r.get("body", "无摘要")),
-    #                 "url": r.get("link", r.get("url", "")),
-    #                 "source": "🌐 联网搜索"
-    #             })
-            
-    #         logger.info(f"✅ 联网搜索完成，获取 {len(formatted)} 条结果")
-    #         return formatted
-            
-    #     except Exception as e:
-    #         logger.error(f"❌ 联网搜索失败: {e}")
-    #         return []
 
     def web_search(self, query: str) -> list[dict]:
         """
@@ -777,9 +705,6 @@ class RAGEngine:
         """DuckDuckGo 搜索实现 (免费备选)"""
         logger.info(f"🔍 [DuckDuckGo] 正在搜索: {query}")
         
-        # raw_results = self.web_search_tool.invoke(query)
-        # results = json.loads(raw_results) if isinstance(raw_results, str) else raw_results
-        
         # 🌟 关键修复：DuckDuckGoSearchAPIWrapper.results() 直接返回 list[dict]
         # 每个 dict 包含: title, link, snippet
         raw_results = self.web_search_tool.results(query, max_results=10)
@@ -899,11 +824,6 @@ class RAGEngine:
             persist_directory=config.CHROMA_PERSIST_DIR,
         )
         
-        # 创建检索器
-        # self.retriever = self.vectorstore.as_retriever(
-        #     search_kwargs={"k": config.TOP_K}
-        # )
-        
         # 🌟 构建高级检索器和 Chain
         self._build_advanced_retriever()
         self._build_chain()
@@ -924,8 +844,6 @@ class RAGEngine:
         """
         path = Path(file_path)
 
-        # if not path.exists() or path.suffix.lower() != ".csv":
-        #     return {"error": "文件不存在或不是 CSV 格式"}
         # 🌟 移除或放宽后缀检查，因为 Gradio 临时文件可能没有 .csv 后缀
         if not path.exists():
             return {"error": f"文件不存在: 文件路径为:{file_path}"}
@@ -1037,26 +955,6 @@ class RAGEngine:
             return "⚠️ 知识库尚未构建索引！请先上传文档。"
         return self.rag_chain.invoke(question)
     
-    # def query_stream(self, question: str):
-    #     """提问（带记忆的流式输出）"""
-    #     if not self.rag_chain or self.rag_chain_with_history is None:
-    #         yield "⚠️ 知识库尚未构建索引！请先上传文档。"
-    #         return
-        
-    #     # 🌟 传入 session_id 配置
-    #     config = {"configurable": {"session_id": self.qa_session_id}}
-
-    #     try:
-    #         # 调用带记忆的 chain 进行流式输出
-    #         for chunk in self.rag_chain_with_history.stream(
-    #             {"question": question}, 
-    #             config=config
-    #         ):
-    #             yield chunk
-    #     except Exception as e:
-    #         logger.error(f"❌ 流式问答失败: {e}")
-    #         yield f"\n\n❌ 回答出错: {str(e)}"
-
     def query_stream(self, question: str):
         """
         🌟 带记忆 + 联网增强的流式问答
