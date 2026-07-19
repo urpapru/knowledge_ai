@@ -1663,8 +1663,8 @@ class RAGEngine:
                 checkpointer=self.agent_checkpointer,
                 middleware=[
                     # 生产级防护 1：限制最大模型调用次数，彻底杜绝死循环和 Token 爆炸！
-                    # 如果 Agent 陷入“思考->报错->再思考”的死循环，达到 15 次后会强制中断并返回已有结果。
-                    ModelCallLimitMiddleware(run_limit=15),
+                    # 如果 Agent 陷入“思考->报错->再思考”的死循环，达到 60 次后会强制中断并返回已有结果。
+                    ModelCallLimitMiddleware(run_limit=60),
                     
                     # 生产级防护 2 (可选)：如果你希望长对话自动压缩，可以取消下面这行的注释
                     # SummarizationMiddleware(max_tokens=4000), 
