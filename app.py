@@ -1,18 +1,35 @@
 """
 Advanced RAG 个人知识库 AI 助手 - 专业级 Web 界面
+
+app.py
+├── 0. 导入与全局配置
+├── 1. Tab 1 功能函数: 知识库问答 (6 个函数)混合检索 + 查询改写 + 重排序 + 联网查询 + 内存记忆
+├── 2. Tab 2 功能函数: 检索透视 (1 个函数)
+├── 3. Tab 3 功能函数: 文档管理 (5 个函数)
+├── 4. Tab 4 功能函数: 关于 (纯静态，0 个函数)
+├── 5. Tab 5 功能函数: 数据分析师 (3 个函数)
+├── 6. 构建 Gradio 界面 (纯 UI 组装)
+│   ├── Tab 1: 💬 知识库问答
+│   ├── Tab 2: 🔍 检索透视
+│   ├── Tab 3: 📁 文档管理
+│   ├── Tab 4: ℹ️ 关于
+│   └── Tab 5: 📈 数据分析师
+└── 7. 启动应用
 """
+
+
+# ============================================================
+# 0. 导入与全局配置 (Imports & Globals)
+# ============================================================
+
 import gradio as gr
 import logging
-import os
 import json
 from pathlib import Path
-
-from rag_engine import RAGEngine
-import config
-
-
 import uuid
 
+import config
+from rag_engine import RAGEngine
 
 # 配置日志
 logging.basicConfig(
@@ -21,13 +38,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+
+
 # 初始化 RAG 引擎
-engine = RAGEngine()
+engine = RAGEngine()  # 全局单例
 
 
-# ===================================================================
-#                         功能函数
-# ===================================================================
+
+# ===================================================================================
+# 1. Tab 1 功能函数: 💬 知识库问答
+#    包含：流式问答、路由决策展示、联网搜索控制、记忆管理
+# ==================================================================================
 
 def chat_fn(message: str, history: list) -> str:
     """聊天处理（带记忆 + 联网搜索的流式）"""
@@ -39,10 +61,10 @@ def chat_fn(message: str, history: list) -> str:
     for chunk in engine.query_stream(message):
         response += chunk
     
-    # 🌟 获取路由决策元信息
+    # 2. 获取路由决策元信息
     meta = engine.get_last_query_meta()
     
-    # 🌟 在回答开头显示路由决策标识
+    # 3. 在回答开头显示路由决策标识
     route_badge = f"\n\n> {meta.get('route_decision', '📚 知识库回答')}\n"
     
     # 附加本地来源信息
@@ -55,7 +77,7 @@ def chat_fn(message: str, history: list) -> str:
                 route_badge += f"  {i}. 📄 `{src['filename']}`\n"
                 seen.add(src["filename"])
     
-    # 🌟 附加联网搜索来源
+    #  附加联网搜索来源
     web_results = meta.get("web_results", [])
     if web_results:
         route_badge += "\n🌐 **联网搜索来源:**\n"
@@ -67,7 +89,7 @@ def chat_fn(message: str, history: list) -> str:
             else:
                 route_badge += f"  {i}. {title}\n"
     
-    # 🌟 手动写入记忆 (流式输出的标准做法) 流式结束后，手动将本轮对话写入后端 Memory！
+    # 4. 手动写入记忆 (流式输出的标准做法) 流式结束后，手动将本轮对话写入后端 Memory！
     pure_ai_response = response.split("\n\n---\n📚 **参考来源:**")[0]
     engine.add_to_qa_memory(message, pure_ai_response)
     
@@ -75,15 +97,51 @@ def chat_fn(message: str, history: list) -> str:
 
 
 
-# 🌟 清空Rag_memory记忆函数
+# 清空Rag_memory记忆函数
 def clear_rag_memory_fn():
     """清空 RAG 对话记忆"""
     msg = engine.clear_qa_memory()
     return msg
 
-#       功能函数补充透视，列举文档，上传文档，删除，清空，构建索引
-# ===================================================================
+def refresh_info():
+    """刷新知识库状态信息"""
+    info = engine.get_index_info()
+    md = ""
+    for k, v in info.items():
+        md += f"- **{k}**: {v}\n"
+    docs = engine.list_documents()
+    if docs:
+        md += f"\n- **文件数**: {len(docs)} 个\n"
+    return md
 
+
+
+## 搜索引擎内的小函数 3个
+def toggle_web_search(enabled):
+    """切换联网搜索开关"""
+    engine.web_search_enabled = enabled
+    status = f"{'✅ 联网搜索已启用' if enabled else '❌ 联网搜索已禁用'}"
+    if enabled:
+        status += f"\n当前引擎: **{engine.search_provider.upper()}**"
+    return status
+
+
+def update_threshold(value):
+    """更新相关性阈值"""
+    engine.relevance_threshold = value
+    return f"✅ 相关性阈值: {value}"
+
+
+def switch_provider(provider):
+    """切换搜索引擎"""
+    return engine.switch_search_provider(provider)
+
+
+
+# =================================================================================
+# 2. Tab 2 功能函数: 🔍 检索透视
+#    包含：检索链路调试、查询改写展示、重排序结果展示
+# =============================================================================
 def debug_retrieval_fn(question: str) -> tuple[str, str, str, str]:
     """
     检索透视：展示检索链路每一步的详细结果
@@ -121,8 +179,21 @@ def debug_retrieval_fn(question: str) -> tuple[str, str, str, str]:
     for r in result.get("reranked_results", []):
         rerank_md += f"| 🏆 #{r['rank']} | {r['content'][:60]}... | `{r['source']}` |\n"
     
-    return rewrite_md, vector_md + "\n" + bm25_md, rerank_md, json.dumps(result, ensure_ascii=False, indent=2)
+    # 5. 原始 JSON 数据
+    raw_json = json.dumps(result, ensure_ascii=False, indent=2)
 
+    return rewrite_md, vector_md + "\n" + bm25_md, rerank_md, raw_json
+
+
+
+
+
+
+
+# ============================================================================================
+# 3. Tab 3 功能函数: 📁 文档管理
+#    包含：文档列表、上传、删除、清空、从目录构建索引
+# =============================================================================================
 
 def list_documents_fn() -> str:
     """列出知识库中的所有文档"""
@@ -208,8 +279,29 @@ def build_index_fn(docs_dir: str) -> tuple[str, str]:
     
     return status, list_documents_fn()
 
-# =====================================================
-# ==================数据分析 agnent ============
+
+
+
+
+
+
+
+# ===============================================================================
+# 4. Tab 4 功能函数: ℹ️ 关于
+#    (纯静态展示，无需额外函数，内容直接写在 UI 中)
+# ====================================================================================
+
+
+
+
+
+
+
+
+# ============================================================
+# 5. Tab 5 功能函数: 📈 数据分析师 (CSV/Excel Agent)
+#    包含：数据加载、流式问答、记忆管理
+# ============================================================
 
 def upload_data_fn(files):
     """处理 CSV /Excel上传并加载到内存"""
@@ -219,7 +311,7 @@ def upload_data_fn(files):
     
     # file_obj = files[0]
     file_obj = files
-    # 🌟 核心修复：正确获取路径
+    #  核心修复：正确获取路径
     if hasattr(file_obj, "name"):
         # 如果是文件对象，取 .name 属性 (临时文件绝对路径)
         file_path = file_obj.name
@@ -233,7 +325,7 @@ def upload_data_fn(files):
     if not file_path or not Path(file_path).exists():
         return f"❌ 文件路径无效或不存在: {file_path}", ""
 
-    # 🌟 调用重构后的通用方法
+    #  调用重构后的通用方法
     result = engine.load_dataframe(file_path)
 
     # # 取第一个文件
@@ -254,14 +346,11 @@ def upload_data_fn(files):
     
     return status_md, preview_md
 
-
-
-# 🌟 核心：适配 LangGraph 的流式处理函数
-# ==========================================
+#==========  核心：适配 LangGraph 的流式处理函数 ==============
+from langchain_core.messages import AIMessage
 def data_chat_fn(message: str, history: list):
     """
-    处理数据分析 Agent 的流式问答
-    注意：这里假设你的 engine 实例名为 engine
+    处理数据分析 Agent 的流式问答(适配 LangGraph create_agent) 
     """
     if not hasattr(engine, 'data_agent') or engine.data_agent is None:
         yield "⚠️ 请先在上方上传 CSV 或 Excel 文件加载数据！"
@@ -273,17 +362,15 @@ def data_chat_fn(message: str, history: list):
             engine.data_session_id = str(uuid.uuid4())
             
         # 2. 配置 LangGraph 的 thread_id
-        config = {"configurable": {"thread_id": engine.data_session_id}}
+        cfg = {"configurable": {"thread_id": engine.data_session_id}}
         
-        # 3. 准备输出变量
-        full_response = ""
-        is_thinking = True
-        
-        # 4. 🌟 流式调用 LangGraph Agent
+
+        # 3. 流式调用 LangGraph Agent
         # stream_mode="values" 会在每个节点执行完毕后返回完整的 state
+        full_response = ""
         for event in engine.data_agent.stream(
             {"messages": [("user", message)]}, 
-            config=config,
+            config=cfg,
             stream_mode="values"
         ):
             # event 是一个字典，包含当前的 messages 列表
@@ -294,13 +381,17 @@ def data_chat_fn(message: str, history: list):
             # 取最后一条消息
             last_msg = messages[-1]
             
-            # 如果是 AI 消息，且有内容 (不是 Tool Call)
-            if hasattr(last_msg, 'content') and last_msg.content:
-                # 过滤掉 Agent 的内部思考过程 (通常以 "Thought:" 或类似标记开头，视模型而定)
-                # 这里我们直接输出 AI 的最终回答
-                if not hasattr(last_msg, 'tool_calls') or not last_msg.tool_calls:
+            # 1. 必须是 AIMessage (排除 HumanMessage 和 ToolMessage)
+            # 2. 必须有 content (排除纯 Tool Call 请求)
+            # 3. 不能包含 tool_calls (排除 AI 正在请求调用工具的中间状态)
+            if (isinstance(last_msg, AIMessage) and 
+                last_msg.content and 
+                not last_msg.tool_calls):
+                
+                # 只有当 AI 真的在说话时，才 yield 给前端
+                if last_msg.content != full_response:
                     full_response = last_msg.content
-                    yield full_response # 🌟 实时 yield 给 Gradio 刷新界面
+                    yield full_response 
                     
         # 如果循环结束还没输出，给个兜底
         if not full_response:
@@ -312,8 +403,7 @@ def data_chat_fn(message: str, history: list):
         
 
 
-# 🌟 清空数据分析记忆函数
-# ==========================================
+#========清空数据分析记忆函数 ===============
 def clear_data_memory_fn():
     """重置数据分析 Agent 的 session_id，变相清空记忆"""
     if hasattr(engine, 'data_session_id'):
@@ -331,11 +421,9 @@ def clear_data_memory_fn():
 
 
 
-
-
-# ===================================================================
-#                         构建 Gradio 界面
-# ===================================================================
+# ============================================================
+# 6. 构建 Gradio 界面 (UI Assembly)
+# ============================================================
 
 # 自定义 CSS（让界面更专业）
 CUSTOM_CSS = """
@@ -376,7 +464,7 @@ with gr.Blocks(
                         fn=chat_fn,
                         # type="messages",
                         examples=[
-                            "总结一下知识库中关于 Python 的内容",
+                            "总结一下知识库中关于的内容",
                             "有哪些重要的技术文档？",
                             "请引用来源回答我的问题",
                         ],
@@ -384,23 +472,17 @@ with gr.Blocks(
                 
                 # 右侧：知识库状态面板
                 with gr.Column(scale=1):
+
+                    # --- 知识库状态 ---
                     gr.Markdown("### 📊 知识库状态")
                     index_info_btn = gr.Button("🔄 刷新状态", size="sm")
                     index_info_display = gr.Markdown("点击刷新查看状态")
-                    
-                    def refresh_info():
-                        info = engine.get_index_info()
-                        md = ""
-                        for k, v in info.items():
-                            md += f"- **{k}**: {v}\n"
-                        docs = engine.list_documents()
-                        if docs:
-                            md += f"\n- **文件数**: {len(docs)} 个\n"
-                        return md
-                    
+                                     
                     index_info_btn.click(refresh_info, outputs=index_info_display)
                     demo.load(refresh_info, outputs=index_info_display)  # 页面加载时自动刷新
 
+
+                    # --- 联网搜索控制 ---
                     # 🌐 联网搜索控制面板
                     gr.Markdown("---")
                     gr.Markdown("### 🌐 联网搜索设置")
@@ -411,39 +493,22 @@ with gr.Blocks(
                         interactive=True,
                     )
                     
-
-
-                    # 🌟 新增：搜索引擎下拉选择
+                    # 🌟搜索引擎下拉选择
                     search_provider_dropdown = gr.Dropdown(
                         label="搜索引擎",
-                        choices=["tavily", "bing", "duckduckgo"],
+                        choices=["tavily","duckduckgo","bing"],
                         value=config.SEARCH_PROVIDER,
                         interactive=True,
                     )
                     
                     relevance_slider = gr.Slider(
                         label="相关性阈值 (默认阈值是0.3)",
-                        minimum=-5.0,
-                        maximum=5.0,
+                        minimum=-1.0,
+                        maximum=1.0,
                         value=0.0,
                         step=0.1,
                         interactive=True,
                     )
-                    
-                    def toggle_web_search(enabled):
-                        engine.web_search_enabled = enabled
-                        status = f"{'✅ 联网搜索已启用' if enabled else '❌ 联网搜索已禁用'}"
-                        if enabled:
-                            status += f"\n当前引擎: **{engine.search_provider.upper()}**"
-                        return status
-                    
-                    def update_threshold(value):
-                        engine.relevance_threshold = value
-                        return f"✅ 相关性阈值: {value}"
-                    
-                    def switch_provider(provider):
-                        msg = engine.switch_search_provider(provider)
-                        return msg
                     
                     web_search_status = gr.Markdown(
                         f"✅ 联网搜索已启用\n当前引擎: **{config.SEARCH_PROVIDER.upper()}**"
@@ -464,7 +529,7 @@ with gr.Blocks(
                         inputs=[relevance_slider], 
                         outputs=[web_search_status]
                     )
-                    # 🌟 绑定切换事件
+                    #  绑定切换事件
                     search_provider_dropdown.change(
                         fn=switch_provider,
                         inputs=[search_provider_dropdown],
@@ -473,11 +538,13 @@ with gr.Blocks(
 
 
 
-
-                    # 🌟 新增：清空 RAG 记忆按钮
+                    # --- 对话记忆管理 ---
+                    # 清空 RAG 记忆按钮
                     gr.Markdown("---")
                     gr.Markdown("### 🧠 对话记忆管理")
-                    clear_rag_memory_btn = gr.Button("🗑️ 清空当前对话记忆", variant="stop", size="sm")
+                    clear_rag_memory_btn = gr.Button(
+                        "🗑️ 清空当前对话记忆", variant="stop", size="sm"
+                    )
                     rag_memory_status = gr.Markdown("")
                     
                     clear_rag_memory_btn.click(
@@ -498,7 +565,7 @@ with gr.Blocks(
             
             debug_input = gr.Textbox(
                 label="输入问题",
-                placeholder="例如：Python 的装饰器怎么用？",
+                placeholder="例如：总结知识库？",
                 lines=2,
             )
             debug_btn = gr.Button("🔍 开始检索分析", variant="primary")
@@ -520,9 +587,9 @@ with gr.Blocks(
                 outputs=[rewrite_output, retrieval_detail, rerank_output, raw_output],
             )
         
-        # =====================================================
+        # ================================================================================================
         # Tab 3: 📁 文档管理
-        # =====================================================
+        # ==============================================================================================
         with gr.Tab("📁 文档管理", id="docs"):
             
             # --- 3.1 文档列表 ---
@@ -581,8 +648,10 @@ with gr.Blocks(
                 fn=clear_all_fn,
                 outputs=[clear_status, doc_list_display],
             )
-            
+        
             gr.Markdown("---")
+
+
             
             # --- 3.3 从目录构建 ---
             with gr.Accordion("📂 从本地目录批量构建（高级）", open=False):
@@ -664,7 +733,7 @@ with gr.Blocks(
 
 
         # =====================================================
-        # Tab 5: 📈 数据分析师 (CSV)
+        # Tab 5: 📈 数据分析师 (CSV/Excel)
         # =====================================================
         with gr.Tab("📈 数据分析师", id="data"):
             gr.Markdown("""
@@ -690,6 +759,8 @@ with gr.Blocks(
             
             gr.Markdown("---")
             
+
+
             # 数据分析聊天区域
             gr.Markdown("### 💬 向数据提问")
             gr.Markdown("*例如：'哪个产品的销量最高？'、'计算每个月的平均增长率'、'画出销售额的折线图（如果支持）'*")
@@ -711,7 +782,7 @@ with gr.Blocks(
                 outputs=[data_status, data_preview]
             )
 
-            # 🌟 新增：清空 Agent 记忆按钮
+            # 清空 Agent 记忆按钮
             with gr.Row():
                 clear_data_memory_btn = gr.Button("🗑️ 清空分析记忆 (重置上下文)", variant="stop", size="sm")
                 data_memory_status = gr.Markdown("")
@@ -721,8 +792,12 @@ with gr.Blocks(
                 outputs=data_memory_status
             )  
 
+
+
+
+
 # ===================================================================
-#                         启动
+#  7. 启动
 # ===================================================================
 
 if __name__ == "__main__":

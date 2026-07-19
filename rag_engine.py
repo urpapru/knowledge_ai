@@ -7,33 +7,36 @@ import logging
 from pathlib import Path
 import hashlib
 import pandas as pd
-
 from typing import List
 import uuid
-
-
+import sys
+import io
 
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_chroma import Chroma 
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+# 文档加载器
 from langchain_community.document_loaders import (
     TextLoader,
     PyPDFLoader,
     Docx2txtLoader,  # 🌟 新增：Word 文档加载器
     DirectoryLoader,
 )
-from langchain_community.document_loaders import DirectoryLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.prompts import ChatPromptTemplate
+
+# 🌟 纯 LCEL 核心组件 (完全基于 langchain-core)
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import RunnablePassthrough
+from langchain_core.chat_history import BaseChatMessageHistory
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.documents import Document
+from langchain_core.tools import tool
+
+
 
 # 🌟 新增：Advanced RAG 核心组件
-
 from langchain_community.retrievers import BM25Retriever
 from langchain_community.cross_encoders import HuggingFaceCrossEncoder
-
-
 # 1. 多查询检索器
 from langchain_classic.retrievers.multi_query import MultiQueryRetriever
 # 2. 混合检索器 & 上下文压缩检索器
@@ -44,32 +47,17 @@ from langchain_classic.retrievers import (
 # 3. 交叉编码器重排序器
 from langchain_classic.retrievers.document_compressors import CrossEncoderReranker
 
-# 🌟 纯 LCEL 核心组件 (完全基于 langchain-core)
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.runnables import RunnablePassthrough
-from langchain_core.chat_history import BaseChatMessageHistory
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.documents import Document
 
-# 记忆与历史
+
+# 记忆与历史 (内存短暂记忆)
 from langchain_community.chat_message_histories import ChatMessageHistory
-# Agent 相关 (LangGraph)
-
 from langgraph.checkpoint.memory import MemorySaver
-from langchain.agents import create_agent # 🌟 1. 新的导入路径
-from langchain.agents.middleware import ModelCallLimitMiddleware # 🌟 2. 引入生产级中间件
-from langgraph.checkpoint.memory import MemorySaver # 或 InMemorySaver
-
 
 
 # 🌟 联网搜索相关
 # ✅ 换成这个（它返回结构化的 list[dict]）
 from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
 from langchain_core.documents import Document
-
-import config
-logger = logging.getLogger(__name__)
-
 # 🌐 联网搜索 - 多引擎支持
 # Tavily
 try:
@@ -89,39 +77,86 @@ except ImportError:
     DDG_AVAILABLE = False
 
 
-# 🌟 核心：自定义一个带“清洗功能”的安全 Python 工具
-# ==========================================
-from langchain_experimental.utilities import PythonREPL
-from langchain_core.tools import tool
-python_repl = PythonREPL()
 
+# Agent 相关 (LangGraph 1.0)
+from langchain.agents import create_agent
+from langchain.agents.middleware import ModelCallLimitMiddleware  # 🌟 2. 引入生产级中间件
+
+
+import config
+logger = logging.getLogger(__name__)
+
+
+
+
+# ==========================================
+# 1. 全局工具函数 (Global Tools for Data Agent)
+# ==========================================
+# 用于在 Tool 中引用当前的 DataFrame (全局变量)
+current_df = None
+
+# 核心：自定义一个带“清洗功能”的安全 Python 工具
+# ==========================================
 @tool
 def safe_python_repl(query: str) -> str:
     """
     用于执行 Python 代码来分析 CSV/Excel 数据。
     输入必须是合法的 Python 代码。支持多行代码。
-    可用变量: df (当前加载的数据框)
+    可用变量: df (当前加载的数据框), pd (pandas库)
     """
-    # 🌟 核心修复：清洗大模型生成的错误转义符！
-    # 把字面量 \\n 替换为真正的换行符 \n
-    clean_code = query.replace("\\n", "\n")
-    clean_code = clean_code.replace("\\\\", "\\")
+    global current_df
+    
+    # 1. 清洗大模型生成的错误转义符
+    clean_code = query.replace("\\n", "\n").replace("\\\\", "\\")
+    
+    # 2. 准备安全的执行环境 (注入 df 和 pd)
+    safe_globals = {
+        "df": current_df,
+        "pd": pd,
+        "__builtins__": __builtins__, # 保留基础内置函数如 print, len, max
+    }
+    
+    # 3. 捕获 print 输出
+    old_stdout = sys.stdout
+    sys.stdout = mystdout = io.StringIO()
     
     try:
-        # 将 df 注入到 REPL 的全局变量中
-        result = python_repl.run(clean_code, globals={"df": current_df, "pd": pd})
-        # 截断过长的输出，防止 Token 爆炸
-        return result[:3000] if len(result) > 3000 else result
+        # 直接使用 Python 原生的 exec() 执行代码，配合 io.StringIO 来捕获输出。这种方式100% 稳定，且完美支持动态注入 df
+        exec(clean_code, safe_globals)
+        
+        # 获取 print 输出的内容
+        output = mystdout.getvalue()
+        
+        # 如果没有 print 输出，尝试获取最后一个表达式的值 (类似 Jupyter)
+        if not output.strip():
+            # 尝试把最后一行当作表达式求值
+            lines = clean_code.strip().split('\n')
+            if lines:
+                last_line = lines[-1]
+                try:
+                    result = eval(last_line, safe_globals)
+                    if result is not None:
+                        output = str(result)
+                except:
+                    pass # 不是表达式，忽略
+                    
+        return output[:3000] if len(output) > 3000 else output if output else "代码执行成功，无输出。"
+        
     except Exception as e:
-        return f"执行出错: {str(e)}"
+        return f"执行出错: {type(e).__name__}: {str(e)}"
+    finally:
+        # 4. 恢复标准输出 (极其重要，否则后端日志会消失)
+        sys.stdout = old_stdout
 
-# 用于在 Tool 中引用当前的 DataFrame
-current_df = None
+
 
 
 class RAGEngine:
     """个人知识库 RAG 引擎"""
     
+    # ==========================================
+    # 2. 初始化与基础配置 (Init & Config)
+    # ==========================================
     def __init__(self):
         # 1.初始化 LLM
         self.llm = ChatOpenAI(
@@ -148,9 +183,6 @@ class RAGEngine:
         self.advanced_retriever = None  # 🔥 改名：现在是高级检索器
         self.rag_chain = None
 
-        # 🌟 新增：CSV 数据分析模块
-        self.dataframes = {}  # 存储上传的 CSV: {"filename.csv": pd.DataFrame}
-        self.data_agent = None # 数据分析 Agent
         
         # 4. 文档切分器
         self.splitter = RecursiveCharacterTextSplitter(
@@ -165,7 +197,7 @@ class RAGEngine:
             ("user", "{question}"),
         ])
         
-        # 6. 🌟 新增：预加载 Reranker 模型 (Cross-Encoder)
+        # 6.预加载 Reranker 模型 (Cross-Encoder)
         # 首次运行会自动下载模型(约1.1G)，后续会走本地缓存:C:\Users\yiquan\.cache\huggingface\hub\models--BAAI--bge-reranker-base
         logger.info("⏳ 正在加载 Reranker 重排序模型 (BAAI/bge-reranker-base)...")
         try:
@@ -176,34 +208,64 @@ class RAGEngine:
             logger.error(f"❌ Reranker 加载失败: {e}。将降级为基础 RAG。")
             self.cross_encoder = None
             
-        # 尝试加载已有索引
+        # 7. 尝试加载已有索引
         self._try_load_existing_index()
 
-        # 🌟 新版 RAG 记忆：使用字典存储不同 session 的历史
-        self.qa_store = {}
-        
-        # 🌟 新版 Agent 记忆：使用 LangGraph 的 MemorySaver
-        self.agent_checkpointer = MemorySaver()
-        self.data_agent = None
-        
+        # 8.  内存记忆初始化 (短暂记忆)
+        self.qa_store = {}  #  RAG 问答记忆字典：使用字典存储不同 session 的历史
+        self.agent_checkpointer = MemorySaver() #  Agent 记忆：使用 LangGraph 的 MemorySaver
         # 用于区分不同会话的 ID
         self.qa_session_id = str(uuid.uuid4())
         self.data_session_id = str(uuid.uuid4())
 
-        # 🌟 联网搜索配置
-        self.web_search_enabled = True  # 全局开关
-        self.relevance_threshold = 0.3  # 🌟 Reranker 相关性阈值 (低于此值触发联网)
 
-        # 🌐 联网搜索初始化 (多引擎支持)
-        # ==========================================
+        
+        #  9. CSV 数据分析模块占位
+        self.dataframes = {}  # 存储上传的 CSV: {"filename.csv": pd.DataFrame}
+        self.data_agent = None # 数据分析 Agent
+
+
+
+
+        # 10. 🌐 联网搜索配置初始化 (多引擎支持)
         self.web_search_enabled = True
-        self.relevance_threshold = 0.3  # bge-reranker-base 建议阈值
+        self.relevance_threshold = 0.3  #  Reranker 相关性阈值 (低于此值触发联网) 。 bge-reranker-base 建议阈值
         self.web_search_tool = None
         self.search_provider = config.SEARCH_PROVIDER  # 从配置读取
-        
         self._init_web_search_tool()
 
 
+
+    def _try_load_existing_index(self):
+        """尝试加载已有的向量数据库，并重建 BM25 所需的 chunks"""
+        if os.path.exists(config.CHROMA_PERSIST_DIR):
+            try:
+                self.vectorstore = Chroma(
+                    persist_directory=config.CHROMA_PERSIST_DIR,
+                    embedding_function=self.embeddings,
+                    collection_name=config.COLLECTION_NAME,
+                )
+                # 检查是否有数据
+                count = self.vectorstore._collection.count()
+                if count > 0:
+                    logger.info(f"✅ 加载已有向量库，包含 {count} 个文档块")
+                    # 🔥 关键：从 Chroma 反向提取所有文档，重建 all_chunks 供 BM25 使用
+                    raw_data = self.vectorstore._collection.get(include=["documents", "metadatas"])
+                    self.all_chunks = [
+                        Document(page_content=doc, metadata=meta)
+                        for doc, meta in zip(raw_data["documents"], raw_data["metadatas"])
+                    ]
+                    logger.info(f"✅ 已从向量库反向恢复 {len(self.all_chunks)} 个文档块用于 BM25")
+
+                    # 构建高级检索器和 Chain
+                    self._build_advanced_retriever()
+                    self._build_chain()
+
+                else:
+                    self.vectorstore = None
+            except Exception as e:
+                logger.warning(f"⚠️ 加载已有索引失败: {e}")
+                self.vectorstore = None
 
     def _init_web_search_tool(self):
         """
@@ -272,11 +334,8 @@ class RAGEngine:
             self.web_search_enabled = False
     
     def switch_search_provider(self, provider: str):
-        """
-        🔄 运行时切换搜索引擎
-        
-        Args:
-            provider: "tavily" | "bing" | "duckduckgo"
+        """ 🔄 运行时切换搜索引擎
+        Args:  provider: "tavily" | "bing" | "duckduckgo"
         """
         self.search_provider = provider
         self._init_web_search_tool()
@@ -284,69 +343,27 @@ class RAGEngine:
        
 
     @staticmethod
-    def _format_docs(docs: List[Document]) -> str:
-        """将检索到的文档列表格式化为纯文本字符串"""
-        return "\n\n".join(doc.page_content for doc in docs)
+    def _strip_html_tags(text: str) -> str:
+        """清理 HTML 标签"""
+        import re
+        clean = re.sub(r'<[^>]+>', '', text)
+        clean = re.sub(r'\s+', ' ', clean).strip()
+        return clean
 
-    def chat_with_memory(self, question: str) -> dict:
-        
-        """非流式带记忆问答 (直接复用 self.rag_chain)"""
-        if not self.rag_chain:
-            return {"answer": "⚠️ 知识库未初始化！", "sources": []}
-        
-        try:
-            # 1. 定义 System Prompt
-            system_prompt = (
-                "你是一个专业的知识库问答助手。请使用以下检索到的上下文来回答用户的问题。\n"
-                "如果你不知道答案，就说你不知道，不要编造。\n"
-                "保持回答简洁专业。\n\n"
-                "上下文:\n{context}"
-            )
-            # 1. 获取历史
-            history = self._get_qa_session_history(self.qa_session_id)
-            
-            # 2. 调用纯净的 Chain (手动传入 history)
-            answer_text = self.rag_chain.invoke({
-                "question": question,
-                "chat_history": history.messages
-            })
-            # 3. 🌟 手动保存记忆 (因为 Chain 是纯净的，所以这里存一次刚刚好)
-            history.add_user_message(question)
-            history.add_ai_message(answer_text)
-            
-            # 4. 滑动窗口裁剪 (保留最近 25 轮)
-            if len(history.messages) > 50:
-                history.messages = history.messages[-50:]
 
-            # 5. 获取来源
-            source_docs = self.advanced_retriever.invoke(question)
-            sources = [{"content": d.page_content[:100], "source": d.metadata.get("source", "未知")} for d in source_docs]
-            
-            return {"answer": answer_text, "sources": sources}
-        except Exception as e:
-            logger.error(f"❌ 问答失败: {e}")
-            return {"answer": f"回答失败: {str(e)}", "sources": []}
-        
 
-    def clear_qa_memory(self):
-        """清空知识问答记忆 (重置 session)"""
-        self.qa_session_id = str(uuid.uuid4()) # 生成新 ID 即可变相清空
-        return "✅ 对话记忆已清空！"
-    
-    def add_to_qa_memory(self, user_message: str, ai_message: str):
-        """
-        🌟 手动将一轮对话添加到 RAG 记忆中 ((专供 query_stream 流式输出后调用))
-        """
-        history = self._get_qa_session_history(self.qa_session_id)
-        history.add_user_message(user_message)
-        history.add_ai_message(ai_message)
-        
-        # 🌟 滑动窗口控制：只保留最近 25 轮 (50 条消息)，防止 Token 爆炸
-        # 因为 ChatMessageHistory 没有自带 k=25 功能，我们手动裁剪
-        if len(history.messages) > 50:
-            history.messages = history.messages[-50:]
 
-    
+
+# ==========================================
+    # 3. Tab 1: 知识库回答 (Knowledge Base QA)
+    # 包含：混合检索、查询改写、重排序、联网查询、内存记忆
+# ==========================================
+
+
+
+
+
+    # --- 3.1 检索器与 Chain 构建 ---
     def _build_advanced_retriever(self):
         """
         🌟 核心改造：组装 Advanced 检索器
@@ -393,38 +410,8 @@ class RAGEngine:
             # 降级处理
             self.advanced_retriever = multi_retriever
             logger.warning("⚠️ Reranker 不可用，已降级为 Multi-Query 检索")    
-    
-    def _try_load_existing_index(self):
-        """尝试加载已有的向量数据库，并重建 BM25 所需的 chunks"""
-        if os.path.exists(config.CHROMA_PERSIST_DIR):
-            try:
-                self.vectorstore = Chroma(
-                    persist_directory=config.CHROMA_PERSIST_DIR,
-                    embedding_function=self.embeddings,
-                    collection_name=config.COLLECTION_NAME,
-                )
-                # 检查是否有数据
-                count = self.vectorstore._collection.count()
-                if count > 0:
-                    logger.info(f"✅ 加载已有向量库，包含 {count} 个文档块")
-                    # 🔥 关键：从 Chroma 反向提取所有文档，重建 all_chunks 供 BM25 使用
-                    raw_data = self.vectorstore._collection.get(include=["documents", "metadatas"])
-                    self.all_chunks = [
-                        Document(page_content=doc, metadata=meta)
-                        for doc, meta in zip(raw_data["documents"], raw_data["metadatas"])
-                    ]
-                    logger.info(f"✅ 已从向量库反向恢复 {len(self.all_chunks)} 个文档块用于 BM25")
 
-                    # 构建高级检索器和 Chain
-                    self._build_advanced_retriever()
-                    self._build_chain()
 
-                else:
-                    self.vectorstore = None
-            except Exception as e:
-                logger.warning(f"⚠️ 加载已有索引失败: {e}")
-                self.vectorstore = None
-    
     def _build_chain(self):
         """构建 带记忆的 RAG LCEL Chain (不带自动记忆包装) """
         if not self.advanced_retriever:
@@ -442,7 +429,7 @@ class RAGEngine:
         # 这样 Chain 就只负责“根据输入生成输出”，不负责“偷偷存记忆”
         self.rag_chain = (
             RunnablePassthrough.assign(
-                context=lambda x: self._format_docs(self.advanced_retriever.invoke(x["question"]))
+                context=lambda x: self._format_docs_plain(self.advanced_retriever.invoke(x["question"]))
             )
 
             | self.rag_prompt
@@ -451,13 +438,232 @@ class RAGEngine:
         )
         logger.info("✅ 纯净版 RAG Chain 构建完成")
 
-    
+
+
+
+
+
+
+
+    # --- 3.2 内存记忆管理 ---
     def _get_qa_session_history(self, session_id: str) -> BaseChatMessageHistory:
         """获取 RAG 问答的 session 历史"""
         if session_id not in self.qa_store:
             self.qa_store[session_id] = ChatMessageHistory()
         return self.qa_store[session_id] 
     
+
+    def add_to_qa_memory(self, user_message: str, ai_message: str):
+        """🌟 手动将一轮对话添加到 RAG 记忆中 (专供 query_stream 流式输出后调用)"""
+
+        history = self._get_qa_session_history(self.qa_session_id)
+        history.add_user_message(user_message)
+        history.add_ai_message(ai_message)
+        
+        # 🌟 滑动窗口控制：只保留最近 25 轮 (50 条消息)，防止 Token 爆炸
+        # 因为 ChatMessageHistory 没有自带 k=25 功能，我们手动裁剪
+        if len(history.messages) > 50:
+            history.messages = history.messages[-50:]
+
+
+    def clear_qa_memory(self):
+        """清空知识问答记忆 (重置 session)"""
+        self.qa_session_id = str(uuid.uuid4()) # 生成新 ID 即可变相清空
+        return "✅ 对话记忆已清空！"
+    
+
+
+
+
+
+
+
+    # --- 3.3 问答核心逻辑 (流式/非流式) ---
+    def query(self, question: str) -> str:
+        """提问（非流式，无记忆）"""
+        if not self.rag_chain:
+            return "⚠️ 知识库尚未构建索引！请先上传文档。"
+        return self.rag_chain.invoke(question)
+
+
+    def chat_with_memory(self, question: str) -> dict:
+        
+        """非流式带记忆问答 
+        (直接复用 self.rag_chain)
+        """
+        if not self.rag_chain:
+            return {"answer": "⚠️ 知识库未初始化！", "sources": []}
+        
+        try:
+            # 1. 定义 System Prompt
+            system_prompt = (
+                "你是一个专业的知识库问答助手。请使用以下检索到的上下文来回答用户的问题。\n"
+                "如果你不知道答案，就说你不知道，不要编造。\n"
+                "保持回答简洁专业。\n\n"
+                "上下文:\n{context}"
+            )
+            # 1. 获取历史
+            history = self._get_qa_session_history(self.qa_session_id)
+            
+            # 2. 调用纯净的 Chain (手动传入 history)
+            answer_text = self.rag_chain.invoke({
+                "question": question,
+                "chat_history": history.messages
+            })
+            # 3. 🌟 手动保存记忆 (因为 Chain 是纯净的，所以这里存一次刚刚好)
+            history.add_user_message(question)
+            history.add_ai_message(answer_text)
+            
+            # 4. 滑动窗口裁剪 (保留最近 25 轮)
+            if len(history.messages) > 50:
+                history.messages = history.messages[-50:]
+
+            # 5. 获取来源
+            source_docs = self.advanced_retriever.invoke(question)
+            sources = [{"content": d.page_content[:100], "source": d.metadata.get("source", "未知")} for d in source_docs]
+            
+            return {"answer": answer_text, "sources": sources}
+        except Exception as e:
+            logger.error(f"❌ 问答失败: {e}")
+            return {"answer": f"回答失败: {str(e)}", "sources": []}
+
+
+    def query_stream(self, question: str):
+        """
+        🌟 带记忆 + 联网增强的流式问答
+        
+        决策流程：
+        1. 先判断知识库是否有相关内容
+        2. 如果有 → 使用本地知识回答
+        3. 如果没有 → 联网搜索，用搜索结果回答
+        4. 混合模式 → 本地知识 + 联网结果一起喂给 LLM
+        """
+        if not self.advanced_retriever:
+            yield "⚠️ 知识库尚未构建索引！请先上传文档。"
+            return
+        
+        # 存储本次问答的元信息（供前端展示）
+        self._last_query_meta = {
+            "used_web_search": False,
+            "web_results": [],
+            "local_sources": [],
+            "route_decision": ""
+        }
+        
+        try:
+            # 第二步：进入 query_stream
+            # 🌟 Step 1: 路由决策
+            use_web, local_docs = self._should_use_web_search(question)
+            
+            # 记录本地来源
+            self._last_query_meta["local_sources"] = [
+                {
+                    "source": doc.metadata.get("source", "未知"),
+                    "filename": Path(doc.metadata.get("source", "")).name,
+                    "content_preview": doc.page_content[:200],
+                }
+                for doc in local_docs
+            ]
+            
+            # 🌟 Step 2: 构建上下文
+            context_parts = []
+            # 组装上下文
+            # local_docs 是空列表 []，在 Python 中 bool([]) 是 False！
+            if local_docs and not use_web:
+                # 情况 A: 纯本地知识
+                context_parts.append("【知识库内容】\n" + self._format_docs_rich(local_docs))
+                self._last_query_meta["route_decision"] = "📚 使用知识库回答"
+                
+            elif use_web:
+                # 情况 B/C: 需要联网搜索
+                yield "🔍 *知识库未找到相关内容，正在联网搜索...*\n\n"
+                
+                web_results = self.web_search(question)
+                # 🌟 如果使用 Tavily，显示 AI 快速摘要
+                tavily_answer = getattr(self, '_tavily_answer', '')
+                if tavily_answer and self.search_provider == "tavily":
+                    yield f"💡 **Tavily AI 快速摘要**: {tavily_answer}\n\n"
+
+                self._last_query_meta["used_web_search"] = True
+                self._last_query_meta["web_results"] = web_results
+                
+                if web_results:
+                    web_context = self._web_results_to_context(web_results)
+                    context_parts.append("【联网搜索结果】\n" + web_context)
+                    
+                    # 如果本地也有一些相关文档，作为补充
+                    if local_docs:
+                        context_parts.append("【知识库补充内容】\n" + self._format_docs_rich(local_docs))
+                        self._last_query_meta["route_decision"] = "🌐 联网搜索 + 知识库补充"
+                    else:
+                        self._last_query_meta["route_decision"] = "🌐 纯联网搜索回答"
+                else:
+                    # 联网也失败了，降级为本地
+                    if local_docs:
+                        context_parts.append("【知识库内容（联网搜索失败，降级使用）】\n" + self._format_docs_rich(local_docs))
+                    else:
+                        yield "😔 抱歉，知识库和联网搜索均未找到相关内容。请尝试换一种问法。"
+                        return
+            
+            # 🌟 Step 3: 构建带联网上下文的 Prompt
+            full_context = "\n\n".join(context_parts)
+            
+            # 使用专门的联网+知识库 Prompt
+            web_aware_prompt = ChatPromptTemplate.from_messages([
+                ("system", 
+                 config.SYSTEM_PROMPT + 
+                 "\n\n请参考以下上下文信息来回答用户的问题。\n"
+                 "如果上下文中包含【联网搜索结果】，请在回答中注明信息来源链接。\n"
+                 "如果知识库和联网搜索都没有相关信息，请诚实说明你不知道。\n\n"
+                 "上下文:\n{context}"
+                ),
+                MessagesPlaceholder(variable_name="chat_history"),
+                ("human", "{question}"),
+            ])
+            
+            # 🌟 Step 4: 构建并执行 Chain
+            temp_chain = (
+                web_aware_prompt
+
+                | self.llm
+                | StrOutputParser()
+            )
+            
+            # 获取历史
+            history = self._get_qa_session_history(self.qa_session_id).messages
+            
+            for chunk in temp_chain.stream({
+                "question": question,
+                "context": full_context,
+                "chat_history": history,
+            }):
+                yield chunk
+                
+        except Exception as e:
+            logger.error(f"❌ 流式问答失败: {e}")
+            yield f"\n\n❌ 回答出错: {str(e)}"
+
+
+    # 供前端获取元信息
+    def get_last_query_meta(self) -> dict:
+        """获取上一次问答的路由决策和来源信息"""
+        return getattr(self, '_last_query_meta', {
+            "used_web_search": False,
+            "web_results": [],
+            "local_sources": [],
+            "route_decision": "未知"
+        })
+    
+
+
+
+
+
+
+
+
+
+    # ------------ 3.4 联网搜索与路由决策 ------------------------------------------------
 
     def _should_use_web_search(self, question: str) -> tuple[bool, list[Document]]:
         """
@@ -520,6 +726,7 @@ class RAGEngine:
         return False, local_docs
 
 
+
     def _get_reranker_score(self, question: str, doc: Document) -> float:
         """
         获取 Reranker 对单个文档的打分
@@ -540,11 +747,11 @@ class RAGEngine:
             logger.warning(f"⚠️ Reranker 打分失败: {e}")
             # 打分失败时返回负数，触发联网搜索
             # # 打分失败时，应该触发联网搜索，而不是假装命中
-            return -1.0   # 而不是 0.5  
+            return -1.0   # 而不是 0.5 
+    
 
 
-
-    ##=================  联网搜索引擎  ========================
+    ##====== 联网搜索引擎 ===========
     def web_search(self, query: str) -> list[dict]:
         """
         🌐 统一联网搜索入口 (自动路由到对应搜索引擎)
@@ -620,14 +827,6 @@ class RAGEngine:
 
         return formatted
     
-
-    @staticmethod
-    def _strip_html_tags(text: str) -> str:
-        """清理 HTML 标签"""
-        import re
-        clean = re.sub(r'<[^>]+>', '', text)
-        clean = re.sub(r'\s+', ' ', clean).strip()
-        return clean
     
     def _bing_search(self, query: str) -> list[dict]:
         """
@@ -746,18 +945,116 @@ class RAGEngine:
         
 
 
-    def _format_docs(self, docs: list[Document]) -> str:
-        """格式化检索到的文档"""
-        formatted = []
-        for i, doc in enumerate(docs, 1):
-            source = doc.metadata.get("source", "未知来源")
-            filename = Path(source).name if source else "未知"
-            formatted.append(
-                f"### [参考资料 {i}] 📄 {filename}\n{doc.page_content}"
+
+
+
+
+
+
+    # ========================================================================================
+    # 4. Tab 2: 检索透视 (Retrieval Insights)
+    # 包含：查看检索过程、得分、来源等
+    # ==========================================================================================
+    def debug_retrieval(self, question: str) -> dict:
+        """
+        为了让"检索透视"生效，先给 RAGEngine 加一个调试方法
+        🔍 检索过程透视：返回检索链路每一步的详细结果
+        用于在 Gradio 中可视化展示
+        
+        """
+        if not self.vectorstore:
+            return {"error": "知识库未构建"}
+        
+        result = {
+            "original_query": question,
+            "rewritten_queries": [],
+            "vector_results": [],
+            "bm25_results": [],
+            "merged_results": [],
+            "reranked_results": [],
+        }
+        
+        try:
+            # Step 1: 查询改写
+            # from langchain.prompts import ChatPromptTemplate as CPT
+            from langchain_core.prompts import ChatPromptTemplate as CPT
+            rewrite_prompt = CPT.from_template(
+                "你是一个查询改写专家。请将用户的问题改写为 3 个不同角度的搜索查询，每行一个，不要输出其他内容。\n\n用户问题: {question}"
             )
-        return "\n\n---\n\n".join(formatted)
+            rewrite_chain = rewrite_prompt | self.llm | StrOutputParser()
+            rewritten = rewrite_chain.invoke({"question": question})
+            result["rewritten_queries"] = [q.strip() for q in rewritten.strip().split("\n") if q.strip()]
+            
+            # Step 2: 向量检索 (Top 10)
+            vector_retriever = self.vectorstore.as_retriever(search_kwargs={"k": 10})
+            all_queries = [question] + result["rewritten_queries"]
+            
+            vector_docs = {}
+            for q in all_queries:
+                for doc in vector_retriever.invoke(q):
+                    doc_id = hashlib.md5(doc.page_content.encode()).hexdigest()[:12]
+                    if doc_id not in vector_docs:
+                        vector_docs[doc_id] = doc
+            result["vector_results"] = [
+                {"content": d.page_content[:100], "source": Path(d.metadata.get("source", "")).name}
+                for d in list(vector_docs.values())[:10]
+            ]
+            
+            # Step 3: BM25 检索 (Top 10)
+            if self.all_chunks:
+                bm25 = BM25Retriever.from_documents(self.all_chunks)
+                bm25.k = 10
+                bm25_docs = bm25.invoke(question)
+                result["bm25_results"] = [
+                    {"content": d.page_content[:100], "source": Path(d.metadata.get("source", "")).name}
+                    for d in bm25_docs
+                ]
+            
+            # Step 4: 最终精排结果
+            if self.advanced_retriever:
+                final_docs = self.advanced_retriever.invoke(question)
+                result["reranked_results"] = [
+                    {
+                        "rank": i + 1,
+                        "content": d.page_content[:150],
+                        "source": Path(d.metadata.get("source", "")).name,
+                    }
+                    for i, d in enumerate(final_docs)
+                ]
+            
+        except Exception as e:
+            result["error"] = str(e)
+            logger.error(f"检索调试失败: {e}")
     
+        return result
+
+
+
+    def get_sources(self, question: str) -> list[dict]:
+        """获取问题相关的文档来源"""
+        if not self.advanced_retriever:
+            return []
+        
+        docs = self.advanced_retriever.invoke(question)
+        sources = []
+        for doc in docs:
+            sources.append({
+                "source": doc.metadata.get("source", "未知"),
+                "filename": Path(doc.metadata.get("source", "")).name,
+                "content_preview": doc.page_content[:200],
+            })
+        return sources
     
+
+
+
+
+
+
+    # ====================================================================================
+    # 5. Tab 3: 文档管理 (Document Management)
+    # 包含：上传、解析、切分、向量化、删除文档
+    # =====================================================================================
     def load_documents(self, docs_dir: str = None) -> dict:
         """
         加载并索引文档
@@ -839,11 +1136,283 @@ class RAGEngine:
         }
         logger.info(f"✅ 索引完成: {stats}")
         return stats
+
+
+    def add_documents(self, file_paths: list[str]) -> dict:
+        """
+        向已有知识库中追加新文档
+        file_paths: 文件路径列表
+        """
+        if not self.embeddings:
+            return {"error": "Embedding 模型未初始化"}
+        
+        all_new_docs = []
+        
+        for file_path in file_paths:
+            path = Path(file_path)
+            if not path.exists():
+                continue
+            
+            # 根据文件类型选择 Loader
+            try:
+                if path.suffix.lower() == ".pdf":
+                    loader = PyPDFLoader(str(path))
+                elif path.suffix.lower() in (".md", ".txt"):
+                    loader = TextLoader(str(path), encoding="utf-8")
+                # 🌟 新增：处理 Word 文档
+                elif path.suffix.lower() == ".docx":
+                    loader = Docx2txtLoader(str(path))
+                else:
+                    logger.warning(f"⚠️ 不支持的文件类型: {path.suffix}")
+                    continue
+                
+                docs = loader.load()
+                all_new_docs.extend(docs)
+            except Exception as e:
+                logger.warning(f"⚠️ 加载 {path.name} 失败: {e}")
+        
+        if not all_new_docs:
+            return {"error": "没有成功加载任何文档"}
+        
+        # 切分文档
+        new_chunks = self.splitter.split_documents(all_new_docs)
+        
+        # 为每个 chunk 生成唯一 ID
+        chunk_ids = []
+        for i, chunk in enumerate(new_chunks):
+            source = chunk.metadata.get("source", "unknown")
+            chunk_ids.append(self._generate_chunk_id(source, i))
+        
+        # 追加到向量库
+        if self.vectorstore is None:
+            # 首次建库
+            self.vectorstore = Chroma.from_documents(
+                documents=new_chunks,
+                embedding=self.embeddings,
+                ids=chunk_ids,
+                collection_name=config.COLLECTION_NAME,
+                persist_directory=config.CHROMA_PERSIST_DIR,
+            )
+        else:
+            # 追加到已有库
+            # ⚠️ 先删除同名文件（避免重复）
+            for file_path in file_paths:
+                source = str(Path(file_path).resolve())
+                filename = Path(file_path).name
+                try:
+                    existing = self.vectorstore._collection.get(
+                        where={"source": {"$contains": filename}},
+                        include=[]
+                    )
+                    if existing["ids"]:
+                        self.vectorstore._collection.delete(ids=existing["ids"])
+                        logger.info(f"🔄 覆盖已有文件: {filename}")
+                except:
+                    pass
+            
+            # 添加新文档
+            self.vectorstore.add_documents(documents=new_chunks, ids=chunk_ids)
+        
+        # 更新内存中的 chunks
+        self.all_chunks.extend(new_chunks)
+        
+        # 重建检索器
+        self._build_advanced_retriever()
+        self._build_chain()
+        
+        stats = {
+            "status": "success",
+            "新增文件数": len(all_new_docs),
+            "新增文本块数": len(new_chunks),
+            "知识库总块数": self.vectorstore._collection.count(),
+        }
+        logger.info(f"✅ 追加文档完成: {stats}")
+        return stats
+
+
+
+    def delete_document(self, source: str) -> dict:
+        """
+        从知识库中删除指定文档的所有文档块
+        source: 文档的完整路径或文件名
+        """
+        if not self.vectorstore:
+            return {"error": "向量库未初始化"}
+        
+        try:
+            filename = Path(source).name
+            
+            # Step 1: 从 Chroma 中删除（按 metadata 中的 source 匹配）
+            # 先查出所有匹配的 ID
+            results = self.vectorstore._collection.get(
+                where={"source": source},
+                include=[]
+            )
+            ids_to_delete = results["ids"]
+            
+            if not ids_to_delete:
+                # 尝试用文件名匹配
+                all_data = self.vectorstore._collection.get(include=["metadatas"])
+                ids_to_delete = [
+                    id_ for id_, meta in zip(all_data["ids"], all_data["metadatas"])
+                    if Path(meta.get("source", "")).name == filename
+                ]
+            
+            if not ids_to_delete:
+                return {"error": f"未找到文档: {filename}"}
+            
+            # 执行删除
+            self.vectorstore._collection.delete(ids=ids_to_delete)
+            
+            # Step 2: 从内存中的 all_chunks 也删除
+            self.all_chunks = [
+                doc for doc in self.all_chunks 
+                if doc.metadata.get("source", "") != source 
+                and Path(doc.metadata.get("source", "")).name != filename
+            ]
+            
+            # Step 3: 重建检索器（因为 BM25 需要更新）
+            remaining_count = self.vectorstore._collection.count()
+            if remaining_count > 0:
+                self._build_advanced_retriever()
+                self._build_chain()
+            else:
+                self.advanced_retriever = None
+                self.rag_chain = None
+            
+            logger.info(f"🗑️ 已删除 {filename} 的 {len(ids_to_delete)} 个文档块")
+            return {
+                "status": "success",
+                "filename": filename,
+                "deleted_chunks": len(ids_to_delete),
+                "remaining_chunks": remaining_count,
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ 删除文档失败: {e}")
+            return {"error": str(e)}
+        
+
+
+
+    def list_documents(self) -> list[dict]:
+        """
+        列出知识库中所有已索引的文档（按文件名聚合）
+        返回：[{"filename": "xxx.pdf", "chunks": 5, "source": "/path/xxx.pdf"}, ...]
+        """
+        if not self.vectorstore:
+            return []
+        
+        try:
+            # 从 Chroma 获取所有 metadata
+            raw_data = self.vectorstore._collection.get(include=["metadatas"])
+            metadatas = raw_data["metadatas"]
+            
+            # 按 source 聚合统计
+            doc_stats = {}
+            for meta in metadatas:
+                source = meta.get("source", "未知")
+                filename = Path(source).name if source else "未知"
+                
+                if source not in doc_stats:
+                    doc_stats[source] = {
+                        "filename": filename,
+                        "source": source,
+                        "chunks": 0,
+                    }
+                doc_stats[source]["chunks"] += 1
+            
+            return list(doc_stats.values())
+        except Exception as e:
+            logger.error(f"❌ 列出文档失败: {e}")
+            return []
+        
+    
+    def clear_all(self) -> dict:
+        """清空整个知识库"""
+        try:
+            import shutil
+            if os.path.exists(config.CHROMA_PERSIST_DIR):
+                shutil.rmtree(config.CHROMA_PERSIST_DIR)
+            
+            self.vectorstore = None
+            self.all_chunks = []
+            self.advanced_retriever = None
+            self.rag_chain = None
+            
+            logger.info("🗑️ 知识库已清空")
+            return {"status": "success", "message": "知识库已完全清空"}
+        except Exception as e:
+            return {"error": str(e)}
+        
+
+    def upload_files_to_temp(self, files) -> list[str]:
+        """
+        将 Gradio 上传的文件保存到临时目录
+        files: Gradio File 组件返回的文件对象列表
+        返回：保存后的文件路径列表
+        """
+        upload_dir = Path("./uploaded_docs")
+        upload_dir.mkdir(exist_ok=True)
+        
+        saved_paths = []
+        for file in files:
+            # Gradio 上传的文件是一个临时路径
+            src_path = Path(file.name if hasattr(file, 'name') else file)
+            dest_path = upload_dir / src_path.name
+            # 复制文件
+            import shutil
+            shutil.copy2(str(src_path), str(dest_path))
+            saved_paths.append(str(dest_path))
+        
+        return saved_paths
+    
+
+    def _generate_chunk_id(self, source: str, index: int) -> str:
+        """
+        为每个文档块生成唯一 ID
+        格式：source_hash + chunk_index
+        例如：a1b2c3_0, a1b2c3_1, a1b2c3_2
+        """
+        source_hash = hashlib.md5(source.encode()).hexdigest()[:8]
+        return f"{source_hash}_{index}"
     
 
 
 
 
+
+    # =====================================================================================
+    # 6. Tab 4: 关于 (About)
+    # 包含：系统信息、索引状态等
+    # ==================================================================================
+    def get_index_info(self) -> dict:
+        """获取当前索引信息"""
+        if not self.vectorstore:
+            return {"状态": "❌ 未构建索引"}
+        
+        try:
+            count = self.vectorstore._collection.count()
+            return {
+                "状态": "✅ 已构建",
+                "文档块数": count,
+                "模型": config.CHAT_MODEL,
+                "Embedding": config.EMBEDDING_MODEL,
+            }
+        except:
+            return {"状态": "⚠️ 索引状态异常"}
+        
+
+
+
+
+
+
+
+    # ===================================================================================
+    # 7. Tab 5: pandas 数据分析agent (Data Insights / CSV Agent)
+    # 包含：CSV/Excel 数据分析 Agent
+    # ====================================================================================
 
     def load_dataframe(self, file_path: str) -> dict:
         """
@@ -967,16 +1536,20 @@ class RAGEngine:
             # 调用 Agent 进行分析
             # 🌟 传入 thread_id (等同于 session_id)
             config = {"configurable": {"thread_id": self.data_session_id}}
+            # 🌟 修复：create_agent 的输入输出格式
             response = self.data_agent.invoke(
-                {"input": question}, 
+                # {"input": question}, 
+                {"messages": [("user", question)]},
                 config=config
             )
-            return response["output"]
+            # 提取最后一条 AI 消息的内容
+            return response["messages"][-1].content
+            # return response["output"]
+
         except Exception as e:
             logger.error(f"❌ 数据分析失败: {e}")
             return f"分析失败: {str(e)}"
         
-
     def clear_data_memory(self):
         """清空数据分析记忆 (重置 thread_id)"""
         self.data_session_id = str(uuid.uuid4())
@@ -984,474 +1557,30 @@ class RAGEngine:
     
 
 
-    
-    # -------- ---------
-    def query(self, question: str) -> str:
-        """提问（非流式）"""
-        if not self.rag_chain:
-            return "⚠️ 知识库尚未构建索引！请先上传文档。"
-        return self.rag_chain.invoke(question)
-    
-    def query_stream(self, question: str):
-        """
-        🌟 带记忆 + 联网增强的流式问答
-        
-        决策流程：
-        1. 先判断知识库是否有相关内容
-        2. 如果有 → 使用本地知识回答
-        3. 如果没有 → 联网搜索，用搜索结果回答
-        4. 混合模式 → 本地知识 + 联网结果一起喂给 LLM
-        """
-        if not self.advanced_retriever:
-            yield "⚠️ 知识库尚未构建索引！请先上传文档。"
-            return
-        
-        # 存储本次问答的元信息（供前端展示）
-        self._last_query_meta = {
-            "used_web_search": False,
-            "web_results": [],
-            "local_sources": [],
-            "route_decision": ""
-        }
-        
-        try:
-            # 第二步：进入 query_stream
-            # 🌟 Step 1: 路由决策
-            use_web, local_docs = self._should_use_web_search(question)
-            
-            # 记录本地来源
-            self._last_query_meta["local_sources"] = [
-                {
-                    "source": doc.metadata.get("source", "未知"),
-                    "filename": Path(doc.metadata.get("source", "")).name,
-                    "content_preview": doc.page_content[:200],
-                }
-                for doc in local_docs
-            ]
-            
-            # 🌟 Step 2: 构建上下文
-            context_parts = []
-            # 组装上下文
-            # local_docs 是空列表 []，在 Python 中 bool([]) 是 False！
-            if local_docs and not use_web:
-                # 情况 A: 纯本地知识
-                context_parts.append("【知识库内容】\n" + self._format_docs(local_docs))
-                self._last_query_meta["route_decision"] = "📚 使用知识库回答"
-                
-            elif use_web:
-                # 情况 B/C: 需要联网搜索
-                yield "🔍 *知识库未找到相关内容，正在联网搜索...*\n\n"
-                
-                web_results = self.web_search(question)
-                # 🌟 如果使用 Tavily，显示 AI 快速摘要
-                tavily_answer = getattr(self, '_tavily_answer', '')
-                if tavily_answer and self.search_provider == "tavily":
-                    yield f"💡 **Tavily AI 快速摘要**: {tavily_answer}\n\n"
 
-                self._last_query_meta["used_web_search"] = True
-                self._last_query_meta["web_results"] = web_results
-                
-                if web_results:
-                    web_context = self._web_results_to_context(web_results)
-                    context_parts.append("【联网搜索结果】\n" + web_context)
-                    
-                    # 如果本地也有一些相关文档，作为补充
-                    if local_docs:
-                        context_parts.append("【知识库补充内容】\n" + self._format_docs(local_docs))
-                        self._last_query_meta["route_decision"] = "🌐 联网搜索 + 知识库补充"
-                    else:
-                        self._last_query_meta["route_decision"] = "🌐 纯联网搜索回答"
-                else:
-                    # 联网也失败了，降级为本地
-                    if local_docs:
-                        context_parts.append("【知识库内容（联网搜索失败，降级使用）】\n" + self._format_docs(local_docs))
-                    else:
-                        yield "😔 抱歉，知识库和联网搜索均未找到相关内容。请尝试换一种问法。"
-                        return
-            
-            # 🌟 Step 3: 构建带联网上下文的 Prompt
-            full_context = "\n\n".join(context_parts)
-            
-            # 使用专门的联网+知识库 Prompt
-            web_aware_prompt = ChatPromptTemplate.from_messages([
-                ("system", 
-                 config.SYSTEM_PROMPT + 
-                 "\n\n请参考以下上下文信息来回答用户的问题。\n"
-                 "如果上下文中包含【联网搜索结果】，请在回答中注明信息来源链接。\n"
-                 "如果知识库和联网搜索都没有相关信息，请诚实说明你不知道。\n\n"
-                 "上下文:\n{context}"
-                ),
-                MessagesPlaceholder(variable_name="chat_history"),
-                ("human", "{question}"),
-            ])
-            
-            # 🌟 Step 4: 构建并执行 Chain
-            temp_chain = (
-                web_aware_prompt
 
-                | self.llm
-                | StrOutputParser()
+
+
+
+
+    # ================================================================
+    # 8. 内部工具函数 (Internal Helpers)
+    # ================================================================
+
+    @staticmethod
+    def _format_docs_plain(docs: List[Document]) -> str:
+        """将检索到的文档列表格式化为纯文本字符串 (供 LCEL Chain 使用)"""
+        return "\n\n".join(doc.page_content for doc in docs)
+    
+    def _format_docs_rich(self, docs: List[Document]) -> str:
+        """格式化检索到的文档，带来源信息 (供 query_stream 组装上下文使用)"""
+        formatted = []
+        for i, doc in enumerate(docs, 1):
+            source = doc.metadata.get("source", "未知来源")
+            filename = Path(source).name if source else "未知"
+            formatted.append(
+                f"### [参考资料 {i}] 📄 {filename}\n{doc.page_content}"
             )
-            
-            # 获取历史
-            history = self._get_qa_session_history(self.qa_session_id).messages
-            
-            for chunk in temp_chain.stream({
-                "question": question,
-                "context": full_context,
-                "chat_history": history,
-            }):
-                yield chunk
-                
-        except Exception as e:
-            logger.error(f"❌ 流式问答失败: {e}")
-            yield f"\n\n❌ 回答出错: {str(e)}"
-
-    # 供前端获取元信息
-    def get_last_query_meta(self) -> dict:
-        """获取上一次问答的路由决策和来源信息"""
-        return getattr(self, '_last_query_meta', {
-            "used_web_search": False,
-            "web_results": [],
-            "local_sources": [],
-            "route_decision": "未知"
-        })
+        return "\n\n---\n\n".join(formatted)
     
-    def get_sources(self, question: str) -> list[dict]:
-        """获取问题相关的文档来源"""
-        if not self.advanced_retriever:
-            return []
-        
-        docs = self.advanced_retriever.invoke(question)
-        sources = []
-        for doc in docs:
-            sources.append({
-                "source": doc.metadata.get("source", "未知"),
-                "filename": Path(doc.metadata.get("source", "")).name,
-                "content_preview": doc.page_content[:200],
-            })
-        return sources
     
-    def get_index_info(self) -> dict:
-        """获取当前索引信息"""
-        if not self.vectorstore:
-            return {"状态": "❌ 未构建索引"}
-        
-        try:
-            count = self.vectorstore._collection.count()
-            return {
-                "状态": "✅ 已构建",
-                "文档块数": count,
-                "模型": config.CHAT_MODEL,
-                "Embedding": config.EMBEDDING_MODEL,
-            }
-        except:
-            return {"状态": "⚠️ 索引状态异常"}
-        
-
-    def _generate_chunk_id(self, source: str, index: int) -> str:
-        """
-        为每个文档块生成唯一 ID
-        格式：source_hash + chunk_index
-        例如：a1b2c3_0, a1b2c3_1, a1b2c3_2
-        """
-        source_hash = hashlib.md5(source.encode()).hexdigest()[:8]
-        return f"{source_hash}_{index}"
-    
-
-    def list_documents(self) -> list[dict]:
-        """
-        列出知识库中所有已索引的文档（按文件名聚合）
-        返回：[{"filename": "xxx.pdf", "chunks": 5, "source": "/path/xxx.pdf"}, ...]
-        """
-        if not self.vectorstore:
-            return []
-        
-        try:
-            # 从 Chroma 获取所有 metadata
-            raw_data = self.vectorstore._collection.get(include=["metadatas"])
-            metadatas = raw_data["metadatas"]
-            
-            # 按 source 聚合统计
-            doc_stats = {}
-            for meta in metadatas:
-                source = meta.get("source", "未知")
-                filename = Path(source).name if source else "未知"
-                
-                if source not in doc_stats:
-                    doc_stats[source] = {
-                        "filename": filename,
-                        "source": source,
-                        "chunks": 0,
-                    }
-                doc_stats[source]["chunks"] += 1
-            
-            return list(doc_stats.values())
-        except Exception as e:
-            logger.error(f"❌ 列出文档失败: {e}")
-            return []
-        
-
-    def delete_document(self, source: str) -> dict:
-        """
-        从知识库中删除指定文档的所有文档块
-        source: 文档的完整路径或文件名
-        """
-        if not self.vectorstore:
-            return {"error": "向量库未初始化"}
-        
-        try:
-            filename = Path(source).name
-            
-            # Step 1: 从 Chroma 中删除（按 metadata 中的 source 匹配）
-            # 先查出所有匹配的 ID
-            results = self.vectorstore._collection.get(
-                where={"source": source},
-                include=[]
-            )
-            ids_to_delete = results["ids"]
-            
-            if not ids_to_delete:
-                # 尝试用文件名匹配
-                all_data = self.vectorstore._collection.get(include=["metadatas"])
-                ids_to_delete = [
-                    id_ for id_, meta in zip(all_data["ids"], all_data["metadatas"])
-                    if Path(meta.get("source", "")).name == filename
-                ]
-            
-            if not ids_to_delete:
-                return {"error": f"未找到文档: {filename}"}
-            
-            # 执行删除
-            self.vectorstore._collection.delete(ids=ids_to_delete)
-            
-            # Step 2: 从内存中的 all_chunks 也删除
-            self.all_chunks = [
-                doc for doc in self.all_chunks 
-                if doc.metadata.get("source", "") != source 
-                and Path(doc.metadata.get("source", "")).name != filename
-            ]
-            
-            # Step 3: 重建检索器（因为 BM25 需要更新）
-            remaining_count = self.vectorstore._collection.count()
-            if remaining_count > 0:
-                self._build_advanced_retriever()
-                self._build_chain()
-            else:
-                self.advanced_retriever = None
-                self.rag_chain = None
-            
-            logger.info(f"🗑️ 已删除 {filename} 的 {len(ids_to_delete)} 个文档块")
-            return {
-                "status": "success",
-                "filename": filename,
-                "deleted_chunks": len(ids_to_delete),
-                "remaining_chunks": remaining_count,
-            }
-            
-        except Exception as e:
-            logger.error(f"❌ 删除文档失败: {e}")
-            return {"error": str(e)}
-        
-    def add_documents(self, file_paths: list[str]) -> dict:
-        """
-        向已有知识库中追加新文档
-        file_paths: 文件路径列表
-        """
-        if not self.embeddings:
-            return {"error": "Embedding 模型未初始化"}
-        
-        all_new_docs = []
-        
-        for file_path in file_paths:
-            path = Path(file_path)
-            if not path.exists():
-                continue
-            
-            # 根据文件类型选择 Loader
-            try:
-                if path.suffix.lower() == ".pdf":
-                    loader = PyPDFLoader(str(path))
-                elif path.suffix.lower() in (".md", ".txt"):
-                    loader = TextLoader(str(path), encoding="utf-8")
-                # 🌟 新增：处理 Word 文档
-                elif path.suffix.lower() == ".docx":
-                    loader = Docx2txtLoader(str(path))
-                else:
-                    logger.warning(f"⚠️ 不支持的文件类型: {path.suffix}")
-                    continue
-                
-                docs = loader.load()
-                all_new_docs.extend(docs)
-            except Exception as e:
-                logger.warning(f"⚠️ 加载 {path.name} 失败: {e}")
-        
-        if not all_new_docs:
-            return {"error": "没有成功加载任何文档"}
-        
-        # 切分文档
-        new_chunks = self.splitter.split_documents(all_new_docs)
-        
-        # 为每个 chunk 生成唯一 ID
-        chunk_ids = []
-        for i, chunk in enumerate(new_chunks):
-            source = chunk.metadata.get("source", "unknown")
-            chunk_ids.append(self._generate_chunk_id(source, i))
-        
-        # 追加到向量库
-        if self.vectorstore is None:
-            # 首次建库
-            self.vectorstore = Chroma.from_documents(
-                documents=new_chunks,
-                embedding=self.embeddings,
-                ids=chunk_ids,
-                collection_name=config.COLLECTION_NAME,
-                persist_directory=config.CHROMA_PERSIST_DIR,
-            )
-        else:
-            # 追加到已有库
-            # ⚠️ 先删除同名文件（避免重复）
-            for file_path in file_paths:
-                source = str(Path(file_path).resolve())
-                filename = Path(file_path).name
-                try:
-                    existing = self.vectorstore._collection.get(
-                        where={"source": {"$contains": filename}},
-                        include=[]
-                    )
-                    if existing["ids"]:
-                        self.vectorstore._collection.delete(ids=existing["ids"])
-                        logger.info(f"🔄 覆盖已有文件: {filename}")
-                except:
-                    pass
-            
-            # 添加新文档
-            self.vectorstore.add_documents(documents=new_chunks, ids=chunk_ids)
-        
-        # 更新内存中的 chunks
-        self.all_chunks.extend(new_chunks)
-        
-        # 重建检索器
-        self._build_advanced_retriever()
-        self._build_chain()
-        
-        stats = {
-            "status": "success",
-            "新增文件数": len(all_new_docs),
-            "新增文本块数": len(new_chunks),
-            "知识库总块数": self.vectorstore._collection.count(),
-        }
-        logger.info(f"✅ 追加文档完成: {stats}")
-        return stats
-    
-    def clear_all(self) -> dict:
-        """清空整个知识库"""
-        try:
-            import shutil
-            if os.path.exists(config.CHROMA_PERSIST_DIR):
-                shutil.rmtree(config.CHROMA_PERSIST_DIR)
-            
-            self.vectorstore = None
-            self.all_chunks = []
-            self.advanced_retriever = None
-            self.rag_chain = None
-            
-            logger.info("🗑️ 知识库已清空")
-            return {"status": "success", "message": "知识库已完全清空"}
-        except Exception as e:
-            return {"error": str(e)}
-
-    def upload_files_to_temp(self, files) -> list[str]:
-        """
-        将 Gradio 上传的文件保存到临时目录
-        files: Gradio File 组件返回的文件对象列表
-        返回：保存后的文件路径列表
-        """
-        upload_dir = Path("./uploaded_docs")
-        upload_dir.mkdir(exist_ok=True)
-        
-        saved_paths = []
-        for file in files:
-            # Gradio 上传的文件是一个临时路径
-            src_path = Path(file.name if hasattr(file, 'name') else file)
-            dest_path = upload_dir / src_path.name
-            # 复制文件
-            import shutil
-            shutil.copy2(str(src_path), str(dest_path))
-            saved_paths.append(str(dest_path))
-        
-        return saved_paths
-    
-
-    def debug_retrieval(self, question: str) -> dict:
-        """
-        为了让"检索透视"生效，先给 RAGEngine 加一个调试方法
-        🔍 检索过程透视：返回检索链路每一步的详细结果
-        用于在 Gradio 中可视化展示
-        
-        """
-        if not self.vectorstore:
-            return {"error": "知识库未构建"}
-        
-        result = {
-            "original_query": question,
-            "rewritten_queries": [],
-            "vector_results": [],
-            "bm25_results": [],
-            "merged_results": [],
-            "reranked_results": [],
-        }
-        
-        try:
-            # Step 1: 查询改写
-            # from langchain.prompts import ChatPromptTemplate as CPT
-            from langchain_core.prompts import ChatPromptTemplate as CPT
-            rewrite_prompt = CPT.from_template(
-                "你是一个查询改写专家。请将用户的问题改写为 3 个不同角度的搜索查询，每行一个，不要输出其他内容。\n\n用户问题: {question}"
-            )
-            rewrite_chain = rewrite_prompt | self.llm | StrOutputParser()
-            rewritten = rewrite_chain.invoke({"question": question})
-            result["rewritten_queries"] = [q.strip() for q in rewritten.strip().split("\n") if q.strip()]
-            
-            # Step 2: 向量检索 (Top 10)
-            vector_retriever = self.vectorstore.as_retriever(search_kwargs={"k": 10})
-            all_queries = [question] + result["rewritten_queries"]
-            
-            vector_docs = {}
-            for q in all_queries:
-                for doc in vector_retriever.invoke(q):
-                    doc_id = hashlib.md5(doc.page_content.encode()).hexdigest()[:12]
-                    if doc_id not in vector_docs:
-                        vector_docs[doc_id] = doc
-            result["vector_results"] = [
-                {"content": d.page_content[:100], "source": Path(d.metadata.get("source", "")).name}
-                for d in list(vector_docs.values())[:10]
-            ]
-            
-            # Step 3: BM25 检索 (Top 10)
-            if self.all_chunks:
-                bm25 = BM25Retriever.from_documents(self.all_chunks)
-                bm25.k = 10
-                bm25_docs = bm25.invoke(question)
-                result["bm25_results"] = [
-                    {"content": d.page_content[:100], "source": Path(d.metadata.get("source", "")).name}
-                    for d in bm25_docs
-                ]
-            
-            # Step 4: 最终精排结果
-            if self.advanced_retriever:
-                final_docs = self.advanced_retriever.invoke(question)
-                result["reranked_results"] = [
-                    {
-                        "rank": i + 1,
-                        "content": d.page_content[:150],
-                        "source": Path(d.metadata.get("source", "")).name,
-                    }
-                    for i, d in enumerate(final_docs)
-                ]
-            
-        except Exception as e:
-            result["error"] = str(e)
-            logger.error(f"检索调试失败: {e}")
-    
-        return result
