@@ -2,6 +2,14 @@
 RAG 引擎：负责文档加载、切分、索引、检索和问答
 Advanced RAG 引擎：负责文档加载、切分、混合检索、重排序和问答
 """
+# 📊 数据可视化相关
+import matplotlib
+matplotlib.use('Agg')  # 🌟 关键：使用非交互式后端，防止 GUI 弹窗
+import matplotlib.pyplot as plt
+import seaborn as sns
+import tempfile
+import shutil
+
 import os
 import logging
 from pathlib import Path
@@ -94,26 +102,36 @@ logger = logging.getLogger(__name__)
 # ==========================================
 # 用于在 Tool 中引用当前的 DataFrame (全局变量)
 current_df = None
+last_chart_path = None  # 存储最近生成的图表路径
+
+# 创建图表输出目录 (持久化，不会被系统自动清理)
+CHART_OUTPUT_DIR = Path("./chart_outputs")
+CHART_OUTPUT_DIR.mkdir(exist_ok=True)
 
 # 核心：自定义一个带“清洗功能”的安全 Python 工具
 # ==========================================
 @tool
 def safe_python_repl(query: str) -> str:
     """
-    用于执行 Python 代码来分析 CSV/Excel 数据。
-    输入必须是合法的 Python 代码。支持多行代码。
-    可用变量: df (当前加载的数据框), pd (pandas库)
+    执行 Python 代码来分析数据。支持多行代码。
+    可用变量: df (当前DataFrame), pd (pandas), np (numpy), plt (matplotlib.pyplot), sns (seaborn)
+    
+    【重要】如果你只是想分析数据、打印统计信息，使用此工具。
+    如果你想画图表，请使用专门的 create_chart 工具（更可靠）。
     """
-    global current_df
+    global current_df, last_chart_path
     
     # 1. 清洗大模型生成的错误转义符
     clean_code = query.replace("\\n", "\n").replace("\\\\", "\\")
     
-    # 2. 准备安全的执行环境 (注入 df 和 pd)
+    # 2. 准备安全的执行环境 (注入 df, pd, 以及绘图库)
     safe_globals = {
         "df": current_df,
         "pd": pd,
-        "__builtins__": __builtins__, # 保留基础内置函数如 print, len, max
+        "np": __import__('numpy'),
+        "plt": plt,
+        "sns": sns,
+        "__builtins__": __builtins__,
     }
     
     # 3. 捕获 print 输出
@@ -121,15 +139,17 @@ def safe_python_repl(query: str) -> str:
     sys.stdout = mystdout = io.StringIO()
     
     try:
-        # 直接使用 Python 原生的 exec() 执行代码，配合 io.StringIO 来捕获输出。这种方式100% 稳定，且完美支持动态注入 df
+        # 执行代码前，关闭所有残留的旧图形
+        plt.close('all')
+        
+        # 执行代码
         exec(clean_code, safe_globals)
         
-        # 获取 print 输出的内容
+        # 获取 print 输出
         output = mystdout.getvalue()
         
-        # 如果没有 print 输出，尝试获取最后一个表达式的值 (类似 Jupyter)
+        # 如果没有 print 输出，尝试获取最后一个表达式的值
         if not output.strip():
-            # 尝试把最后一行当作表达式求值
             lines = clean_code.strip().split('\n')
             if lines:
                 last_line = lines[-1]
@@ -138,15 +158,134 @@ def safe_python_repl(query: str) -> str:
                     if result is not None:
                         output = str(result)
                 except:
-                    pass # 不是表达式，忽略
-                    
-        return output[:3000] if len(output) > 3000 else output if output else "代码执行成功，无输出。"
+                    pass
+        
+        # 🌟 核心新增：自动检测是否有未保存的 matplotlib 图形
+        chart_info = ""
+        figs = _auto_save_figures()
+        if figs:
+            last_chart_path = figs[0]  # 取第一张图
+            chart_info = f"\n\n[CHART_SAVED: {last_chart_path}]"
+        
+        result = output[:3000] if len(output) > 3000 else output if output else "代码执行成功，无输出。"
+        return result + chart_info
         
     except Exception as e:
+        plt.close('all')  # 出错也必须关闭图形，防止内存泄漏
         return f"执行出错: {type(e).__name__}: {str(e)}"
     finally:
-        # 4. 恢复标准输出 (极其重要，否则后端日志会消失)
         sys.stdout = old_stdout
+@tool
+def create_chart(code: str) -> str:
+    """
+    🎨 专用绘图工具：执行 Matplotlib/Seaborn 代码并保存图表。
+    
+    当你需要生成可视化图表时，请使用此工具（而不是 safe_python_repl）。
+    
+    Args:
+        code: 完整的 Python 绘图代码。代码中可以直接使用以下变量：
+              - df: 当前加载的 DataFrame
+              - pd: pandas
+              - np: numpy  
+              - plt: matplotlib.pyplot
+              - sns: seaborn
+    
+    代码要求：
+    1. 不需要 import 语句（plt, sns, pd, np 已自动导入）
+    2. 不需要调用 plt.savefig()（系统会自动保存）
+    3. 不需要调用 plt.show()（系统会自动处理）
+    4. 建议设置 figsize 让图表更美观
+    5. 标题和标签请使用中文
+    
+    示例代码：
+        fig, ax = plt.subplots(figsize=(10, 6))
+        sns.barplot(data=df, x='类别', y='数值', ax=ax, palette='viridis')
+        ax.set_title('各类别数值对比', fontsize=16, fontweight='bold')
+        ax.set_xlabel('类别', fontsize=12)
+        ax.set_ylabel('数值', fontsize=12)
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+    """
+    global current_df, last_chart_path
+    
+    # 清洗代码
+    clean_code = code.replace("\\n", "\n").replace("\\\\", "\\")
+    
+    # 准备执行环境
+    safe_globals = {
+        "df": current_df,
+        "pd": pd,
+        "np": __import__('numpy'),
+        "plt": plt,
+        "sns": sns,
+        "__builtins__": __builtins__,
+    }
+    
+    try:
+        # 关闭所有残留图形
+        plt.close('all')
+        
+        # 执行绘图代码
+        exec(clean_code, safe_globals)
+        
+        # 🌟 自动保存
+        saved = _auto_save_figures()
+        
+        if saved:
+            last_chart_path = saved[0]
+            return f"✅ 图表已成功生成并保存！路径: {last_chart_path}\n请在回答中告知用户图表已生成。"
+        else:
+            return "⚠️ 代码执行成功，但未检测到任何图形。请确保代码中创建了 figure (例如 plt.subplots() 或 sns.xxx())"
+            
+    except Exception as e:
+        plt.close('all')
+        return f"❌ 绘图代码执行失败: {type(e).__name__}: {str(e)}\n请检查代码语法并重试。"
+
+def _auto_save_figures() -> list[str]:
+    """
+    🌟 自动检测并保存所有打开的 matplotlib 图形
+    
+    原理：
+    - plt.get_fignums() 返回当前所有打开的 figure 编号
+    - 如果代码中创建了 figure 但没有 savefig，我们在这里自动保存
+    - 保存后关闭所有 figure 释放内存
+    
+    返回: 保存的图片路径列表
+    """
+    global last_chart_path
+    
+    saved_paths = []
+    fig_nums = plt.get_fignums()
+    
+    if not fig_nums:
+        return saved_paths
+    
+    import time
+    timestamp = int(time.time() * 1000)  # 毫秒级时间戳，避免文件名冲突
+    
+    for i, num in enumerate(fig_nums):
+        fig = plt.figure(num)
+        
+        # 检查 figure 是否有实际内容 (排除空 figure)
+        if not fig.axes:
+            continue
+        
+        # 自动生成文件名
+        filename = f"chart_{timestamp}_{i}.png"
+        filepath = CHART_OUTPUT_DIR / filename
+        
+        try:
+            fig.savefig(str(filepath), dpi=150, bbox_inches='tight', 
+                       facecolor='white', edgecolor='none')
+            saved_paths.append(str(filepath))
+            logger.info(f"📊 自动保存图表: {filepath}")
+        except Exception as e:
+            logger.warning(f"⚠️ 自动保存图表失败: {e}")
+    
+    # 🌟 关键：关闭所有图形，释放内存
+    plt.close('all')
+    
+    return saved_paths
 
 
 
@@ -223,7 +362,8 @@ class RAGEngine:
         #  9. CSV 数据分析模块占位
         self.dataframes = {}  # 存储上传的 CSV: {"filename.csv": pd.DataFrame}
         self.data_agent = None # 数据分析 Agent
-
+        # 📊 初始化 matplotlib 中文字体
+        self._setup_matplotlib_chinese()
 
 
 
@@ -1477,34 +1617,56 @@ class RAGEngine:
             df_head = df.head(3).to_string()
 
 
-            # 🌟 5. system_prompt 直接接受纯字符串 (不再需要 SystemMessage 包装)
+            # 5. system_prompt 直接接受纯字符串 (不再需要 SystemMessage 包装)
+            # 构建增强版 system_prompt (包含图表工具使用说明)
             system_prompt_text = (
-                "你是一个专业的数据分析师。你可以使用 Pandas 对提供的 DataFrame (`df`) 进行数据分析。\n"
-                "请使用中文回答。在编写 Python 代码时，请直接使用变量 `df`，无需重新读取文件。\n"
-                "【重要代码格式警告】：当你调用工具执行代码时，必须确保代码中的换行符是真正的换行符，"
+                "你是一个专业的数据分析师和数据可视化专家。\n"
+                "你可以使用 Pandas 对提供的 DataFrame (`df`) 进行数据分析，并使用图表工具生成精美的可视化图表。\n"
+                "请使用中文回答。\n\n"
+                
+                "## 你的工具：\n"
+                "1. **safe_python_repl**: 执行 Python 代码进行数据分析、统计计算、数据清洗等\n"
+                "2. **create_chart**: 专门用于生成 Matplotlib/Seaborn 图表\n\n"
+                
+                "## 工作流程：\n"
+                "1. 如果用户要求分析数据：使用 safe_python_repl 执行分析代码\n"
+                "2. 如果用户要求画图：使用 create_chart 工具生成图表\n"
+                "3. 如果需要先分析再画图：先用 safe_python_repl 准备数据，再用 create_chart 画图\n\n"
+                
+                "## 图表规范：\n"
+                "- 始终设置 figsize 保证图表足够大 (建议 10x6 或 12x8)\n"
+                "- 标题使用中文，fontsize=16, fontweight='bold'\n"
+                "- 轴标签使用中文，fontsize=12\n"
+                "- 如果 x 轴标签过长，使用 plt.xticks(rotation=45)\n"
+                "- 始终调用 plt.tight_layout() 防止标签被裁剪\n"
+                "- 使用 sns 的调色板让图表更美观\n\n"
+                
+                "## 【重要代码格式警告】：\n"
+                "当你调用工具执行代码时，必须确保代码中的换行符是真正的换行符，"
                 "绝对不要输出字面量 '\\n' (反斜杠+n)。\n\n"
+                
                 f"当前数据概览:\n"
                 f"- 行数: {rows}, 列数: {cols}\n"
                 f"- 列名及类型: {columns_info}\n"
                 f"- 前3行预览:\n{df_head}"
-            )
+            )   
 
             # 初始化 LangGraph Checkpointer (现在它真的生效了！)
             if not hasattr(self, 'agent_checkpointer') or self.agent_checkpointer is None:
                 self.agent_checkpointer = MemorySaver()
 
-            # 🌟 6. 构建生产级 Agent (引入 Middleware 中间件)
+            #  6. 构建生产级 Agent (引入 Middleware 中间件)
             self.data_agent = create_agent(
                 model=self.llm,
-                tools=[safe_python_repl],
-                system_prompt=system_prompt_text, # 🌟 新版参数：直接传字符串
+                tools=[safe_python_repl, create_chart],  #  两个工具
+                system_prompt=system_prompt_text, # 新版参数：直接传字符串
                 checkpointer=self.agent_checkpointer,
                 middleware=[
-                    # 🌟 生产级防护 1：限制最大模型调用次数，彻底杜绝死循环和 Token 爆炸！
+                    # 生产级防护 1：限制最大模型调用次数，彻底杜绝死循环和 Token 爆炸！
                     # 如果 Agent 陷入“思考->报错->再思考”的死循环，达到 15 次后会强制中断并返回已有结果。
                     ModelCallLimitMiddleware(run_limit=15),
                     
-                    # 🌟 生产级防护 2 (可选)：如果你希望长对话自动压缩，可以取消下面这行的注释
+                    # 生产级防护 2 (可选)：如果你希望长对话自动压缩，可以取消下面这行的注释
                     # SummarizationMiddleware(max_tokens=4000), 
                 ]
             )
@@ -1556,7 +1718,74 @@ class RAGEngine:
         return "✅ 分析记忆已清空！"
     
 
+    # ================ 数据可视化=============
+    @staticmethod
+    def _setup_matplotlib_chinese():
+        """
+        🌟 配置 Matplotlib 中文字体 (跨平台兼容)
+        关键：必须在 sns.set_theme() 之后设置字体，否则会被 Seaborn 覆盖！
+        """
+        import platform
+        system = platform.system()
+        
+        # ① 先设置 Seaborn 主题（这会重置 matplotlib 的 rcParams）
+        sns.set_theme(style="whitegrid", palette="husl")
+        
+        # ② 然后再设置中文字体（覆盖 Seaborn 的默认字体）
+        if system == "Windows":
+            # Windows 系统：优先使用微软雅黑（比黑体更美观）
+            plt.rcParams['font.sans-serif'] = [
+                'Microsoft YaHei',  # 微软雅黑（Win7+ 自带）
+                'SimHei',           # 黑体（所有 Windows 自带）
+                'SimSun',           # 宋体（备选）
+            ]
+        elif system == "Darwin":  # macOS
+            plt.rcParams['font.sans-serif'] = [
+                'PingFang SC',      # 苹方（macOS 自带）
+                'Heiti SC',         # 黑体-SC
+                'STHeiti',          # 华文黑体
+            ]
+        else:  # Linux
+            plt.rcParams['font.sans-serif'] = [
+                'WenQuanYi Micro Hei',
+                'Noto Sans CJK SC',
+                'DejaVu Sans',
+            ]
+        
+        # ③ 解决负号 '-' 显示为方块的问题
+        plt.rcParams['axes.unicode_minus'] = False
+        
+        # ④ 验证字体是否生效
+        from matplotlib.font_manager import FontManager
+        fm = FontManager()
+        available_fonts = set(f.name for f in fm.ttflist)
+        
+        chosen_font = None
+        for font in plt.rcParams['font.sans-serif']:
+            if font in available_fonts:
+                chosen_font = font
+                break
+        
+        if chosen_font:
+            logger.info(f"✅ Matplotlib 中文字体已配置: 使用 '{chosen_font}' (系统: {system})")
+        else:
+            logger.warning(
+                f"⚠️ 未找到可用的中文字体！当前可用字体数: {len(available_fonts)}。"
+                f"图表中的中文可能显示为方块。"
+            )
 
+    # 
+    def get_last_chart(self) -> str | None:
+        """获取最近生成的图表路径"""
+        global last_chart_path
+        if last_chart_path and Path(last_chart_path).exists():
+            return last_chart_path
+        return None
+    
+    def clear_last_chart(self):
+        """清空最近生成的图表"""
+        global last_chart_path
+        last_chart_path = None
 
 
 

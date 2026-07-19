@@ -348,58 +348,101 @@ def upload_data_fn(files):
 
 #==========  核心：适配 LangGraph 的流式处理函数 ==============
 from langchain_core.messages import AIMessage
-def data_chat_fn(message: str, history: list):
+
+def data_chat_fn(message: str, history: list, user_already_added: bool = False, thinking_added: bool = False):
     """
-    处理数据分析 Agent 的流式问答(适配 LangGraph create_agent) 
+    🌟 处理数据分析 Agent 的流式问答 + 图表展示
+    适配 LangGraph create_agent + Gradio 6.0 messages 格式
     """
-    if not hasattr(engine, 'data_agent') or engine.data_agent is None:
-        yield "⚠️ 请先在上方上传 CSV 或 Excel 文件加载数据！"
+    global engine
+
+    # 🌟 第一步：立即 yield 清空输入框
+    if not message.strip():
+        yield history, None
         return
-        
+    
+
+    
+    if not hasattr(engine, 'data_agent') or engine.data_agent is None:
+        # 如果用户消息还没添加（兼容旧逻辑），则添加
+        if not user_already_added:
+            history.append({"role": "user", "content": message})
+        history.append({"role": "assistant", "content": "⚠️ 请先在上方上传 CSV 或 Excel 文件加载数据！"})
+        yield history, None
+        return
+    
     try:
-        # 1. 确保 data_session_id 存在 (用于 LangGraph 记忆)
+        # 1. 确保 session_id 存在
         if not hasattr(engine, 'data_session_id') or not engine.data_session_id:
+            import uuid
             engine.data_session_id = str(uuid.uuid4())
-            
-        # 2. 配置 LangGraph 的 thread_id
+        
+        # 2. 清空上一次的图表
+        engine.clear_last_chart()
+        
+        # 3. 配置 LangGraph
         cfg = {"configurable": {"thread_id": engine.data_session_id}}
         
-
-        # 3. 流式调用 LangGraph Agent
-        # stream_mode="values" 会在每个节点执行完毕后返回完整的 state
+        # 4. 流式调用 Agent
         full_response = ""
+        first_chunk_received = False  # 🌟 标记是否收到第一个 AI 回复
+        
         for event in engine.data_agent.stream(
-            {"messages": [("user", message)]}, 
+            {"messages": [("user", message)]},
             config=cfg,
             stream_mode="values"
         ):
-            # event 是一个字典，包含当前的 messages 列表
             messages = event.get("messages", [])
             if not messages:
                 continue
-                
-            # 取最后一条消息
+            
             last_msg = messages[-1]
             
-            # 1. 必须是 AIMessage (排除 HumanMessage 和 ToolMessage)
-            # 2. 必须有 content (排除纯 Tool Call 请求)
-            # 3. 不能包含 tool_calls (排除 AI 正在请求调用工具的中间状态)
             if (isinstance(last_msg, AIMessage) and 
                 last_msg.content and 
                 not last_msg.tool_calls):
                 
-                # 只有当 AI 真的在说话时，才 yield 给前端
                 if last_msg.content != full_response:
                     full_response = last_msg.content
-                    yield full_response 
                     
-        # 如果循环结束还没输出，给个兜底
+                    # 🌟 关键改造：第一次收到 AI 回复时，替换掉"正在思考"提示
+                    if thinking_added and not first_chunk_received:
+                        # 弹掉"正在思考"提示
+                        history.pop()
+                        first_chunk_received = True
+                    
+                    # 添加 AI 的回复
+                    history.append({"role": "assistant", "content": full_response})
+                    yield history, None
+                    history.pop()  # 弹掉 AI 回复，保留用户消息
+        
+        # 5. 流结束后，检查是否有图表生成
+        chart_path = engine.get_last_chart()
+        
+        # 6. 最终确认
         if not full_response:
-            yield "✅ 分析完成，但未生成文本回复（可能仅执行了代码）。"
-            
+            full_response = "✅ 分析完成，但未生成文本回复（可能仅执行了代码或生成了图表）。"
+        
+        # 清理掉 [CHART_SAVED: ...] 标记（不让用户看到这个内部标记）
+        import re
+        full_response = re.sub(r'\[CHART_SAVED:.*?\]', '', full_response).strip()
+        
+        # 🌟 如果 AI 从未回复过（极端情况），确保弹掉"正在思考"提示
+        if thinking_added and not first_chunk_received:
+            history.pop()
+
+        # ✅ 最终版本：正式添加 AI 回复到 history
+        history.append({"role": "assistant", "content": full_response})
+        yield history, chart_path
+        
+
     except Exception as e:
         logger.error(f"❌ 数据分析 Agent 执行失败: {e}")
-        yield f"\n\n❌ 分析出错: {str(e)}"
+        # 🌟 错误时，如果"正在思考"还在，也要弹掉它
+        if thinking_added and not first_chunk_received:
+            history.pop()
+        history.append({"role": "assistant", "content": f"\n\n❌ 分析出错: {str(e)}"})
+        yield history, None
         
 
 
@@ -438,7 +481,7 @@ CUSTOM_CSS = """
 
 with gr.Blocks(
     title="📚 Advanced RAG 知识库 AI 助手",
-    css=CUSTOM_CSS,
+    # css=CUSTOM_CSS, 放在了 launch() 
 ) as demo:
     
     # ===== 顶部标题 =====
@@ -732,24 +775,26 @@ with gr.Blocks(
 
 
 
+
         # =====================================================
-        # Tab 5: 📈 数据分析师 (CSV/Excel)
+        # Tab 5: 📈 数据分析师 (CSV/Excel + 图表可视化)
         # =====================================================
         with gr.Tab("📈 数据分析师", id="data"):
             gr.Markdown("""
-            ### 📊 AI 数据分析师
-            > 上传你的 `.csv` 或 `.xlsx/.xls` 数据文件，AI 将自动读取表结构，并允许你用自然语言进行复杂的数据分析。
-            > *注：对于 Excel 文件，AI 默认读取第一个 Sheet 页。数据仅在内存中处理，关闭页面即销毁。*
+            ### 📊 AI 数据分析师 & 可视化专家
+            > 上传你的 `.csv` 或 `.xlsx/.xls` 数据文件，AI 将自动读取表结构，并允许你用自然语言进行复杂的数据分析和**图表生成**。
+            > 
+            > 🎨 **支持图表库**: Matplotlib (基础图表) | Seaborn (统计美化图表)
             """)
             
+            # --- 数据上传区域 ---
             with gr.Row():
                 with gr.Column(scale=1):
-                    # 🌟 核心修改：扩展 file_types，修改 label
                     data_upload = gr.File(
                         label="上传数据文件 (支持 .csv, .xlsx, .xls)",
                         file_count="single",
                         file_types=[".csv", ".xlsx", ".xls"],
-                        type="filepath"  # 🌟 这一行如果没加，Gradio 3.18 就会传一个奇怪的对象过来
+                        type="filepath"
                     )
                     upload_data_btn = gr.Button("📥 加载数据", variant="primary")
                 
@@ -759,39 +804,184 @@ with gr.Blocks(
             
             gr.Markdown("---")
             
-
-
-            # 数据分析聊天区域
-            gr.Markdown("### 💬 向数据提问")
-            gr.Markdown("*例如：'哪个产品的销量最高？'、'计算每个月的平均增长率'、'画出销售额的折线图（如果支持）'*")
+            # --- 💬 数据分析 + 图表展示区域 ---
+            gr.Markdown("### 💬 向数据提问 (支持图表生成)")
+            gr.Markdown("""
+            **提问示例：**
+            - 📊 "画出各产品类别的销售额柱状图"
+            - 📈 "用折线图展示每月的销售趋势"  
+            - 🔥 "生成一个数值列之间的相关性热力图"
+            - 🥧 "画一个饼图，展示各分类的占比"
+            - 📦 "用箱线图展示数据的分布情况"
+            """)
             
-            data_chatbot = gr.ChatInterface(
-                fn=data_chat_fn,
-                # type="messages",
-                examples=[
-                    "帮我总结一下这份数据的基本信息",
-                    "找出数值最大的前 5 条记录",
-                    "按类别分组，计算每组的平均值",
-                ]
-            )
+            with gr.Row():
+                # 🌟 左侧：聊天区域
+                with gr.Column(scale=3):
+                    # 手动构建 Chatbot (替代 ChatInterface，以支持多输出)
+                    data_chatbot = gr.Chatbot(
+                        label="对话记录",
+                        height=500,
+                    )
+                    
+                    with gr.Row():
+                        data_question = gr.Textbox(
+                            label="输入你的问题",
+                            placeholder="例如：帮我画一个柱状图，展示各部门的人数",
+                            lines=2,
+                            scale=4,
+                        )
+                        data_ask_btn = gr.Button(
+                            "🚀 发送", 
+                            variant="primary", 
+                            scale=1
+                        )
+                    
+                    # 快捷示例按钮
+                    with gr.Row():
+                        gr.Markdown("**💡 快捷示例：**")
+                    with gr.Row():
+                        ex_btn_1 = gr.Button("📊 柱状图", size="sm")
+                        ex_btn_2 = gr.Button("📈 折线图", size="sm")
+                        ex_btn_3 = gr.Button("🥧 饼图", size="sm")
+                        ex_btn_4 = gr.Button("🔥 热力图", size="sm")
+                        ex_btn_5 = gr.Button("📦 箱线图", size="sm")
+                
+                # 🌟 右侧：图表展示区域
+                with gr.Column(scale=2):
+                    gr.Markdown("#### 🖼️ 生成的图表")
+                    
+                    chart_image = gr.Image(
+                        label="图表预览",
+                        type="filepath",
+                        height=400,
+                        interactive=False,
+                    )
+                    
+                    chart_download = gr.File(
+                        label="📥 下载图表",
+                        visible=True,
+                    )
+                    
+                    # 清空图表按钮
+                    clear_chart_btn = gr.Button("🗑️ 清除当前图表", size="sm")
+                    
+                    def clear_chart_display():
+                        return None, None
+                    
+                    clear_chart_btn.click(
+                        fn=clear_chart_display,
+                        outputs=[chart_image, chart_download],
+                    )
             
-            # 绑定事件 更新函数名和组件名
+            # --- 记忆管理 ---
+            gr.Markdown("---")
+            with gr.Row():
+                clear_data_memory_btn = gr.Button(
+                    "🗑️ 清空分析记忆 (重置上下文)", 
+                    variant="stop", 
+                    size="sm"
+                )
+                data_memory_status = gr.Markdown("")
+            
+            # ========== 事件绑定 ==========
+            
+            # 1. 加载数据
             upload_data_btn.click(
                 fn=upload_data_fn,
                 inputs=[data_upload],
                 outputs=[data_status, data_preview]
             )
 
-            # 清空 Agent 记忆按钮
-            with gr.Row():
-                clear_data_memory_btn = gr.Button("🗑️ 清空分析记忆 (重置上下文)", variant="stop", size="sm")
-                data_memory_status = gr.Markdown("")
+             # 🌟 用一个隐藏的状态组件暂存用户消息
+            pending_message = gr.State(None)
+            
+            # 步骤 1：保存消息 + 清空输入框（立即执行，无需等待）
+            def save_and_clear(message):
+                if not message.strip():
+                    return gr.update(), None  # 空消息不清空，也不保存
+                return "", message  # 清空输入框，同时保存消息到 State
+            
+            # 步骤 2：执行 AI 分析
+            def process_and_respond(saved_message, history):
+                """从 State 中取出消息，执行 AI 分析"""
+                if not saved_message:
+                    yield history, None
+                    return
                 
-            clear_data_memory_btn.click(
-                fn=clear_data_memory_fn, 
-                outputs=data_memory_status
-            )  
+                # 先把用户消息加入 history，并立刻 yield 一次！
+                # 这样用户的消息会瞬间显示在聊天框中，不用等 AI 思考
+                history = history or []
+                history.append({"role": "user", "content": saved_message})
+                yield history, None  # 立刻更新 UI，显示用户消息
 
+                # ② 🌟 添加"正在思考"提示
+                history.append({"role": "assistant", "content": "AI 正在分析，请稍候..."})
+                yield history, None  # 立刻显示思考提示
+
+                # ③ 调用 data_chat_fn 获取 AI 回复
+                # 传入 user_already_added=True 和 thinking_added=True
+                # 让 data_chat_fn 知道用户消息和思考提示都已经添加过了
+                yield from data_chat_fn(saved_message, history, user_already_added=True, thinking_added=True)
+
+            # 2. 发送问题   点击发送按钮的链式调用
+            data_ask_btn.click(
+                fn=save_and_clear,
+                inputs=[data_question],
+                outputs=[data_question, pending_message],
+            ).then(
+                fn=process_and_respond,
+                inputs=[pending_message, data_chatbot],
+                outputs=[data_chatbot, chart_image],
+            )
+            
+            # 3.回车发送也用同样的链式逻辑
+            data_question.submit(
+                fn=save_and_clear,
+                inputs=[data_question],
+                outputs=[data_question, pending_message],
+            ).then(
+                fn=process_and_respond,
+                inputs=[pending_message, data_chatbot],
+                outputs=[data_chatbot, chart_image],
+            )
+
+            # 4. 清空记忆
+            clear_data_memory_btn.click(
+                fn=clear_data_memory_fn,
+                outputs=data_memory_status
+            )
+            
+            # 5. 快捷示例按钮绑定
+            def make_example_fn(text):
+                def fn():
+                    return text
+                return fn
+            
+            ex_btn_1.click(fn=make_example_fn("请用 Seaborn 画一个柱状图，展示数据中主要分类和数值的对比"), outputs=[data_question])
+            ex_btn_2.click(fn=make_example_fn("请用 Matplotlib 画一个折线图，展示数据的趋势变化"), outputs=[data_question])
+            ex_btn_3.click(fn=make_example_fn("请画一个饼图，展示数据中各类别的占比分布（取前10个最多的类别）"), outputs=[data_question])
+            ex_btn_4.click(fn=make_example_fn("请用 Seaborn 生成一个所有数值列之间的相关性热力图"), outputs=[data_question])
+            ex_btn_5.click(fn=make_example_fn("请用 Seaborn 画一个箱线图，展示所有数值列的数据分布情况"), outputs=[data_question])
+            
+            # 6. 图表下载联动 (当 chart_image 更新时，同步更新下载文件)
+            def sync_download(chart_path):
+                if chart_path and Path(chart_path).exists():
+                    return gr.update(value=chart_path, visible=True)
+                return gr.update(value=None, visible=False)
+            
+            chart_image.change(
+                fn=sync_download,
+                inputs=[chart_image],
+                outputs=[chart_download],
+            )
+
+            # 发送后清空输入框
+            def clear_input():
+                return ""
+            
+            data_ask_btn.click(fn=clear_input, outputs=[data_question], queue=False)
+            data_question.submit(fn=clear_input, outputs=[data_question], queue=False)
 
 
 
@@ -804,7 +994,9 @@ if __name__ == "__main__":
     demo.launch(
         # server_name="0.0.0.0",
         server_name="127.0.0.1",  # 改成本地回环地址，Windows 浏览器完美识别
+        share=True,                
         server_port=7860,
-        share=False,
+        # share=False,    # To create a public link, set `share=True` in `launch()`
         theme=gr.themes.Soft(primary_hue="blue", secondary_hue="purple"),
+        css=CUSTOM_CSS,
     )
