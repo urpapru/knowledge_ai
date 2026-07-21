@@ -27,7 +27,7 @@ import logging
 import json
 from pathlib import Path
 import uuid
-
+import re
 import config
 from rag_engine import RAGEngine
 
@@ -43,6 +43,11 @@ logger = logging.getLogger(__name__)
 
 # 初始化 RAG 引擎
 engine = RAGEngine()  # 全局单例
+
+from ml_engine import MLEngine
+
+# 初始化 ML 引擎（和 RAGEngine 并列）
+ml_engine = MLEngine()
 
 
 
@@ -459,6 +464,120 @@ def clear_data_memory_fn():
 
 
 
+
+
+
+# ============================================================================================
+# 6. Tab 6 功能函数: 🤖 机器学习实验室
+# ============================================================================================
+
+def upload_ml_data_fn(files):
+    """处理 CSV/Excel 上传并加载到 ML 引擎"""
+    if not files:
+        return "⚠️ 请选择 CSV/xls/xlsx 文件", ""
+    
+    file_obj = files
+    if hasattr(file_obj, "name"):
+        file_path = file_obj.name
+    else:
+        file_path = str(file_obj)
+    
+    print(f"🔍 DEBUG ML: 解析到的文件路径 -> {file_path}")
+    
+    if not file_path or not Path(file_path).exists():
+        return f"❌ 文件路径无效或不存在: {file_path}", ""
+    
+    result = ml_engine.load_dataframe(file_path)
+    
+    if "error" in result:
+        return f"❌ 加载失败: {result['error']}", ""
+    
+    status_md = f"""
+    ### ✅ 数据加载成功！
+    - **文件名**: `{result['filename']}`
+    - **数据规模**: {result['rows']} 行 × {result['columns']} 列
+    - **数值列**: {', '.join(result.get('numeric_cols', [])) or '无'}
+    - **分类列**: {', '.join(result.get('categorical_cols', [])) or '无'}
+    - **时间列**: {', '.join(result.get('datetime_cols', [])) or '无'}
+    - **文本列**: {', '.join(result.get('text_cols', [])) or '无'}
+    """
+    preview_md = f"### 📊 数据预览 (前 3 行)\n{result['preview']}"
+    return status_md, preview_md
+
+
+def clear_ml_memory_fn():
+    """清空机器学习记忆"""
+    return ml_engine.clear_memory()
+
+
+# ========== ML 流式聊天核心 ==========
+def ml_chat_fn(message: str, history: list, user_already_added: bool = False, thinking_added: bool = False):
+    """
+    ML 实验室流式问答核心（适配 LangGraph create_agent）
+    """
+    if not message.strip():
+        yield history, None, None
+        return
+    
+    if not hasattr(ml_engine, 'agent') or ml_engine.agent is None:
+        if not user_already_added:
+            history.append({"role": "user", "content": message})
+        history.append({"role": "assistant", "content": "⚠️ 请先在上方上传 CSV 或 Excel 文件加载数据！"})
+        yield history, None, None
+        return
+    
+    try:
+        if not hasattr(ml_engine, 'session_id') or not ml_engine.session_id:
+            ml_engine.session_id = str(uuid.uuid4())
+        
+        ml_engine.clear_last_chart()
+        
+        full_response = ""
+        first_chunk_received = False
+        
+        for chunk in ml_engine.query_stream(message):
+            full_response = chunk
+            
+            # 清理内部标记
+            clean_resp = re.sub(r'\[CHART_SAVED:.*?\]', '', full_response).strip()
+            
+            if thinking_added and not first_chunk_received:
+                # 替换"正在思考"提示
+                if history and history[-1].get("role") == "assistant":
+                    history[-1] = {"role": "assistant", "content": clean_resp}
+                else:
+                    history.append({"role": "assistant", "content": clean_resp})
+                first_chunk_received = True
+            else:
+                if history and history[-1].get("role") == "assistant":
+                    history[-1] = {"role": "assistant", "content": clean_resp}
+                else:
+                    history.append({"role": "assistant", "content": clean_resp})
+            
+            # 检查图表
+            chart_path = ml_engine.get_last_chart()
+            yield history, chart_path, None
+        
+        # 最终检查模型文件
+        model_path = ml_engine.get_latest_model()
+        pipe_path = ml_engine.get_latest_pipeline()
+        
+        # 清理最终响应中的标记
+        if history and history[-1].get("role") == "assistant":
+            final_clean = re.sub(r'\[CHART_SAVED:.*?\]', '', history[-1].get("content", "")).strip()
+            history[-1] = {"role": "assistant", "content": final_clean}
+        
+        # 如果有管道，优先返回管道；否则返回模型
+        download_path = pipe_path or model_path
+        yield history, ml_engine.get_last_chart(), download_path
+        
+    except Exception as e:
+        logger.error(f"❌ ML Agent 执行失败: {e}")
+        if thinking_added and not first_chunk_received:
+            if history and history[-1].get("role") == "assistant" and "正在执行" in history[-1].get("content", ""):
+                history.pop()
+        history.append({"role": "assistant", "content": f"❌ 分析出错: {str(e)}"})
+        yield history, None, None
 
 
 
@@ -984,6 +1103,213 @@ with gr.Blocks(
             data_question.submit(fn=clear_input, outputs=[data_question], queue=False)
 
 
+
+
+
+
+
+
+        # =====================================================
+        # Tab 6: 🤖 机器学习实验室
+        # =====================================================
+        with gr.Tab("🤖 机器学习实验室", id="ml"):
+            gr.Markdown("""
+            ### 🤖 AI 机器学习实验室
+            > 上传你的 `.csv` 或 `.xlsx/.xls` 数据文件，AI 将自动完成从数据预处理到模型部署的全流程。
+            > 
+            > **支持任务**: 分类 | 回归 | 聚类 | 降维  
+            > **支持算法**: Scikit-learn, XGBoost, LightGBM, CatBoost, Optuna(调参), SHAP(解释)
+            """)
+            
+            # --- 数据上传区域 ---
+            with gr.Row():
+                with gr.Column(scale=1):
+                    ml_upload = gr.File(
+                        label="上传数据文件 (支持 .csv, .xlsx, .xls)",
+                        file_count="single",
+                        file_types=[".csv", ".xlsx", ".xls"],
+                        type="filepath"
+                    )
+                    ml_upload_btn = gr.Button("📥 加载数据", variant="primary")
+                    
+                    gr.Markdown("---")
+                    gr.Markdown("### 🎯 任务类型")
+                    ml_task_type = gr.Radio(
+                        choices=["自动检测", "分类", "回归", "聚类", "降维"],
+                        value="自动检测",
+                        label="选择任务类型（可选，AI 也可自动推断）",
+                        interactive=True,
+                    )
+                
+                with gr.Column(scale=2):
+                    ml_status = gr.Markdown("等待上传数据...")
+                    ml_preview = gr.Markdown("")
+            
+            gr.Markdown("---")
+            
+            # --- 聊天与可视化区域 ---
+            gr.Markdown("### 💬 向机器学习助手提问")
+            gr.Markdown("""
+            **提问示例：**
+            - 🎯 "走完整的分类流程，目标列是 'Survived'"
+            - 📈 "用 XGBoost 做回归预测，并用 Optuna 调参"
+            - 🔍 "对数据进行聚类分析，比较 KMeans 和 DBSCAN"
+            - ⚙️ "做特征工程，训练随机森林，并解释特征重要性"
+            - 🔮 "使用 PCA 降维到 2 维并可视化"
+            """)
+            
+            with gr.Row():
+                # 左侧：聊天
+                with gr.Column(scale=3):
+                    ml_chatbot = gr.Chatbot(
+                        label="对话记录",
+                        height=500,
+                    )
+                    
+                    with gr.Row():
+                        ml_question = gr.Textbox(
+                            label="输入你的问题",
+                            placeholder="例如：用随机森林分类器预测目标变量，走完整流程并调参",
+                            lines=2,
+                            scale=4,
+                        )
+                        ml_ask_btn = gr.Button("🚀 发送", variant="primary", scale=1)
+                    
+                    with gr.Row():
+                        gr.Markdown("**💡 快捷示例：**")
+                    with gr.Row():
+                        ml_ex_1 = gr.Button("🎯 完整分类流程", size="sm")
+                        ml_ex_2 = gr.Button("📈 完整回归流程", size="sm")
+                        ml_ex_3 = gr.Button("🔍 聚类分析", size="sm")
+                        ml_ex_4 = gr.Button("⚙️ 超参数调优", size="sm")
+                        ml_ex_5 = gr.Button("🔮 SHAP解释", size="sm")
+                
+                # 右侧：图表与模型下载
+                with gr.Column(scale=2):
+                    gr.Markdown("#### 🖼️ 生成的图表")
+                    ml_chart_image = gr.Image(
+                        label="图表预览",
+                        type="filepath",
+                        height=400,
+                        interactive=False,
+                    )
+                    ml_chart_download = gr.File(
+                        label="📥 下载图表",
+                        visible=True,
+                    )
+                    
+                    gr.Markdown("#### 💾 模型与管道")
+                    ml_model_download = gr.File(
+                        label="📥 下载训练好的模型/管道",
+                        visible=True,
+                    )
+                    
+                    clear_ml_chart_btn = gr.Button("🗑️ 清除当前图表", size="sm")
+                    
+                    def clear_ml_display():
+                        return None, None
+                    
+                    clear_ml_chart_btn.click(
+                        fn=clear_ml_display,
+                        outputs=[ml_chart_image, ml_chart_download],
+                    )
+            
+            gr.Markdown("---")
+            with gr.Row():
+                clear_ml_memory_btn = gr.Button(
+                    "🗑️ 清空机器学习记忆", variant="stop", size="sm"
+                )
+                ml_memory_status = gr.Markdown("")
+            
+            # ========== 事件绑定 ==========
+            
+            # 1. 加载数据
+            ml_upload_btn.click(
+                fn=upload_ml_data_fn,
+                inputs=[ml_upload],
+                outputs=[ml_status, ml_preview]
+            )
+            
+            # 2. 聊天流式处理（参照 Tab5 的 State + .then 链式模式）
+            ml_pending = gr.State(None)
+            
+            def ml_save_and_clear(msg):
+                if not msg.strip():
+                    return gr.update(), None
+                return "", msg
+            
+            def ml_process_and_respond(saved_msg, history):
+                if not saved_msg:
+                    yield history, None, None
+                    return
+                
+                history = history or []
+                history.append({"role": "user", "content": saved_msg})
+                yield history, None, None
+                
+                history.append({"role": "assistant", "content": "🤖 AI 正在执行机器学习分析，请稍候..."})
+                yield history, None, None
+                
+                # 调用流式生成器
+                for h, chart, model in ml_chat_fn(saved_msg, history, user_already_added=True, thinking_added=True):
+                    yield h, chart, model
+            
+            ml_ask_btn.click(
+                fn=ml_save_and_clear,
+                inputs=[ml_question],
+                outputs=[ml_question, ml_pending],
+            ).then(
+                fn=ml_process_and_respond,
+                inputs=[ml_pending, ml_chatbot],
+                outputs=[ml_chatbot, ml_chart_image, ml_model_download],
+            )
+            
+            ml_question.submit(
+                fn=ml_save_and_clear,
+                inputs=[ml_question],
+                outputs=[ml_question, ml_pending],
+            ).then(
+                fn=ml_process_and_respond,
+                inputs=[ml_pending, ml_chatbot],
+                outputs=[ml_chatbot, ml_chart_image, ml_model_download],
+            )
+            
+            # 3. 清空记忆
+            clear_ml_memory_btn.click(
+                fn=clear_ml_memory_fn,
+                outputs=ml_memory_status
+            )
+            
+            # 4. 快捷示例按钮
+            def make_ml_example(text):
+                def fn():
+                    return text
+                return fn
+            
+            ml_ex_1.click(fn=make_ml_example("请走完整的分类流程，自动检测目标变量，进行数据预处理、特征工程、模型训练、调参和评估"), outputs=[ml_question])
+            ml_ex_2.click(fn=make_ml_example("请走完整的回归流程，进行数据预处理、特征工程、训练 XGBoost 和 LightGBM 模型，用 Optuna 调参并比较性能"), outputs=[ml_question])
+            ml_ex_3.click(fn=make_ml_example("对数据进行聚类分析，比较 KMeans、DBSCAN 和层次聚类的效果，并可视化"), outputs=[ml_question])
+            ml_ex_4.click(fn=make_ml_example("使用 GridSearchCV 和 Optuna 对当前最佳模型进行超参数调优，并绘制调参结果"), outputs=[ml_question])
+            ml_ex_5.click(fn=make_ml_example("训练一个树模型，使用 SHAP 解释特征重要性，并绘制 summary plot 和 dependence plot"), outputs=[ml_question])
+            
+            # 5. 图表下载联动
+            def sync_ml_download(path):
+                if path and Path(path).exists():
+                    return gr.update(value=path, visible=True)
+                return gr.update(value=None, visible=False)
+            
+            ml_chart_image.change(
+                fn=sync_ml_download,
+                inputs=[ml_chart_image],
+                outputs=[ml_chart_download],
+            )
+            
+            # 6. 清空输入框
+            def clear_input():
+                return ""
+            
+            ml_ask_btn.click(fn=clear_input, outputs=[ml_question], queue=False)
+            ml_question.submit(fn=clear_input, outputs=[ml_question], queue=False)
 
 
 # ===================================================================
