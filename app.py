@@ -8,13 +8,15 @@ app.py
 ├── 3. Tab 3 功能函数: 文档管理 (5 个函数)
 ├── 4. Tab 4 功能函数: 关于 (纯静态，0 个函数)
 ├── 5. Tab 5 功能函数: 数据分析师 (3 个函数)
-├── 6. 构建 Gradio 界面 (纯 UI 组装)
+|___6. Tab 6 功能函数：机器学习实验室()
+├── 7. 构建 Gradio 界面 (纯 UI 组装)
 │   ├── Tab 1: 💬 知识库问答
 │   ├── Tab 2: 🔍 检索透视
 │   ├── Tab 3: 📁 文档管理
 │   ├── Tab 4: ℹ️ 关于
 │   └── Tab 5: 📈 数据分析师
-└── 7. 启动应用
+|   |__ Tab 6: 机器学习实验室
+└── 8. 启动应用
 """
 
 
@@ -29,7 +31,9 @@ from pathlib import Path
 import uuid
 import re
 import config
-from rag_engine import RAGEngine
+
+from langchain_core.messages import AIMessage
+
 
 # 配置日志
 logging.basicConfig(
@@ -40,12 +44,15 @@ logger = logging.getLogger(__name__)
 
 
 
-
+from rag_engine import RAGEngine
 # 初始化 RAG 引擎
 engine = RAGEngine()  # 全局单例
 
-from ml_engine import MLEngine
+from data_engine import DataEngine
+# 初始化数据分析引擎
+data_engine = DataEngine()
 
+from ml_engine import MLEngine
 # 初始化 ML 引擎（和 RAGEngine 并列）
 ml_engine = MLEngine()
 
@@ -300,166 +307,166 @@ def build_index_fn(docs_dir: str) -> tuple[str, str]:
 
 
 
-
-
-
 # ============================================================
 # 5. Tab 5 功能函数: 📈 数据分析师 (CSV/Excel Agent)
 #    包含：数据加载、流式问答、记忆管理
 # ============================================================
 
 def upload_data_fn(files):
-    """处理 CSV /Excel上传并加载到内存"""
-    # 在 Gradio 3.x (file_count="single") 中，files 直接是文件对象或字符串，不是列表！
+    """处理 CSV/Excel 上传并加载到 DataEngine"""
     if not files:
         return "⚠️ 请选择 CSV/xls/xlsx 文件", ""
-    
-    # file_obj = files[0]
+
     file_obj = files
-    #  核心修复：正确获取路径
+    # 正确获取路径
     if hasattr(file_obj, "name"):
         # 如果是文件对象，取 .name 属性 (临时文件绝对路径)
         file_path = file_obj.name
-    else:
         # 如果直接是字符串路径，直接使用
+    else:
         file_path = str(file_obj)
 
-    # 调试信息：打印实际获取到的路径，方便排查
     print(f"🔍 DEBUG: 解析到的文件路径 -> {file_path}")
 
     if not file_path or not Path(file_path).exists():
         return f"❌ 文件路径无效或不存在: {file_path}", ""
 
-    #  调用重构后的通用方法
-    result = engine.load_dataframe(file_path)
+    result = data_engine.load_dataframe(file_path)
 
-    # # 取第一个文件
-    # file_path = files[0].name if hasattr(files[0], 'name') else files[0]
-    # result = engine.load_csv(file_path)
-    
     if "error" in result:
         return f"❌ 加载失败: {result['error']}", ""
-    
+
     status_md = f"""
     ### ✅ 数据加载成功！
     - **文件名**: `{result['filename']}`
     - **数据规模**: {result['rows']} 行 × {result['columns']} 列
     - **字段信息**: {result['columns_info']}
     """
-
     preview_md = f"### 📊 数据预览 (前 3 行)\n{result['preview']}"
-    
     return status_md, preview_md
 
-#==========  核心：适配 LangGraph 的流式处理函数 ==============
-from langchain_core.messages import AIMessage
 
-def data_chat_fn(message: str, history: list, user_already_added: bool = False, thinking_added: bool = False):
+#==========  核心：适配 LangGraph 的流式处理函数 ==============
+
+def data_chat_fn(
+    message: str, history: list, user_already_added: bool = False, thinking_added: bool = False
+):
     """
-    🌟 处理数据分析 Agent 的流式问答 + 图表展示
+    处理数据分析 Agent 的流式问答 + 图表展示
     适配 LangGraph create_agent + Gradio 6.0 messages 格式
     """
-    global engine
-
-    # 🌟 第一步：立即 yield 清空输入框
+    # 第一步：立即 yield 清空输入框
     if not message.strip():
         yield history, None
         return
-    
 
-    
-    if not hasattr(engine, 'data_agent') or engine.data_agent is None:
+    if not hasattr(data_engine, 'agent') or data_engine.agent is None:
         # 如果用户消息还没添加（兼容旧逻辑），则添加
         if not user_already_added:
             history.append({"role": "user", "content": message})
-        history.append({"role": "assistant", "content": "⚠️ 请先在上方上传 CSV 或 Excel 文件加载数据！"})
+        history.append(
+            {"role": "assistant", "content": "⚠️ 请先在上方上传 CSV 或 Excel 文件加载数据！"}
+        )
         yield history, None
         return
-    
+
     try:
         # 1. 确保 session_id 存在
-        if not hasattr(engine, 'data_session_id') or not engine.data_session_id:
-            import uuid
-            engine.data_session_id = str(uuid.uuid4())
-        
+        if not hasattr(data_engine, 'session_id') or not data_engine.session_id:
+            data_engine.session_id = str(uuid.uuid4())
         # 2. 清空上一次的图表
-        engine.clear_last_chart()
-        
-        # 3. 配置 LangGraph
-        cfg = {"configurable": {"thread_id": engine.data_session_id}}
-        
-        # 4. 流式调用 Agent
+        data_engine.clear_last_chart()
+
         full_response = ""
-        first_chunk_received = False  # 🌟 标记是否收到第一个 AI 回复
-        
-        for event in engine.data_agent.stream(
-            {"messages": [("user", message)]},
-            config=cfg,
-            stream_mode="values"
-        ):
+        first_chunk_received = False  #  标记是否收到第一个 AI 回复
+
+        for event in data_engine.stream_raw(message):
             messages = event.get("messages", [])
             if not messages:
                 continue
-            
+
             last_msg = messages[-1]
-            
-            if (isinstance(last_msg, AIMessage) and 
-                last_msg.content and 
-                not last_msg.tool_calls):
-                
+
+            if (
+                isinstance(last_msg, AIMessage)
+                and last_msg.content
+                and not last_msg.tool_calls
+            ):
                 if last_msg.content != full_response:
                     full_response = last_msg.content
-                    
-                    # 🌟 关键改造：第一次收到 AI 回复时，替换掉"正在思考"提示
+                    # 关键改造：第一次收到 AI 回复时，替换掉"正在思考"提示
                     if thinking_added and not first_chunk_received:
-                        # 弹掉"正在思考"提示
-                        history.pop()
+                        if history and history[-1].get("role") == "assistant":
+                            history[-1] = {
+                                "role": "assistant",
+                                "content": full_response,
+                            }
+                        else:
+                           
+                            history.append(
+                                {"role": "assistant", "content": full_response}
+                            )
                         first_chunk_received = True
-                    
-                    # 添加 AI 的回复
-                    history.append({"role": "assistant", "content": full_response})
-                    yield history, None
-                    history.pop()  # 弹掉 AI 回复，保留用户消息
-        
-        # 5. 流结束后，检查是否有图表生成
-        chart_path = engine.get_last_chart()
-        
-        # 6. 最终确认
+                    else:
+                        if history and history[-1].get("role") == "assistant":
+                            history[-1] = {
+                                "role": "assistant",
+                                "content": full_response,
+                            }
+                        else:
+                            # 添加 AI 的回复
+                            history.append(
+                                {"role": "assistant", "content": full_response}
+                            )
+
+                    chart_path = data_engine.get_last_chart()
+                    yield history, chart_path
+
+                    # 为下一次更新做准备：弹出临时的 AI 消息
+                    if history and history[-1].get("role") == "assistant":
+                        history.pop()
+
+        # 流结束后，检查是否有图表生成
+        chart_path = data_engine.get_last_chart()
+
+        # 最终确认
         if not full_response:
             full_response = "✅ 分析完成，但未生成文本回复（可能仅执行了代码或生成了图表）。"
-        
-        # 清理掉 [CHART_SAVED: ...] 标记（不让用户看到这个内部标记）
-        import re
-        full_response = re.sub(r'\[CHART_SAVED:.*?\]', '', full_response).strip()
-        
-        # 🌟 如果 AI 从未回复过（极端情况），确保弹掉"正在思考"提示
-        if thinking_added and not first_chunk_received:
-            history.pop()
 
-        # ✅ 最终版本：正式添加 AI 回复到 history
+        # 清理掉 [CHART_SAVED: ...] 内部标记
+        full_response = re.sub(r'\[CHART_SAVED:.*?\]', '', full_response).strip()
+
+        # 极端情况：AI 从未回复过，弹掉"正在思考"提示，
+        if thinking_added and not first_chunk_received:
+            if (
+                history
+                and history[-1].get("role") == "assistant"
+                and "正在执行" in history[-1].get("content", "")
+            ):
+                history.pop() # 弹掉"正在思考"提示
+
+        # 正式添加 AI 回复到 history
         history.append({"role": "assistant", "content": full_response})
         yield history, chart_path
-        
 
     except Exception as e:
         logger.error(f"❌ 数据分析 Agent 执行失败: {e}")
-        # 🌟 错误时，如果"正在思考"还在，也要弹掉它
+        # 错误时，如果"正在思考"还在，也要弹掉它
         if thinking_added and not first_chunk_received:
-            history.pop()
+            if (
+                history
+                and history[-1].get("role") == "assistant"
+                and "正在执行" in history[-1].get("content", "")
+            ):
+                history.pop()
         history.append({"role": "assistant", "content": f"\n\n❌ 分析出错: {str(e)}"})
         yield history, None
+
         
-
-
-#========清空数据分析记忆函数 ===============
 def clear_data_memory_fn():
-    """重置数据分析 Agent 的 session_id，变相清空记忆"""
-    if hasattr(engine, 'data_session_id'):
-        engine.data_session_id = str(uuid.uuid4())
-        # 可选：如果需要彻底清空 LangGraph 的 MemorySaver，需要更复杂的操作
-        # 但重置 thread_id 对于用户体验来说已经足够了
-        return "✅ 数据分析记忆已清空！可以开始新的分析会话。"
-    return "⚠️ 尚未初始化数据分析 Agent。"
+    """清空数据分析 Agent 记忆"""
+    return data_engine.clear_memory()
+
 
 
 
@@ -664,7 +671,7 @@ with gr.Blocks(
                     )
                     
                     relevance_slider = gr.Slider(
-                        label="相关性阈值 (默认阈值是0.3)",
+                        label="知识库与问题相关性阈值 (默认阈值是0.3,小于阈值联网)",
                         minimum=-1.0,
                         maximum=1.0,
                         value=0.0,

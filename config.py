@@ -10,7 +10,7 @@ BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1" # 公共地址
 
 
 # 模型配置
-CHAT_MODEL = "qwen3.6-plus"            # 对话模型
+CHAT_MODEL = "qwen-max"            # 对话模型
 EMBEDDING_MODEL = "text-embedding-v3"  # 向量化模型
 
 # RAG 配置

@@ -2,23 +2,14 @@
 RAG 引擎：负责文档加载、切分、索引、检索和问答
 Advanced RAG 引擎：负责文档加载、切分、混合检索、重排序和问答
 """
-# 📊 数据可视化相关
-import matplotlib
-matplotlib.use('Agg')  # 🌟 关键：使用非交互式后端，防止 GUI 弹窗
-import matplotlib.pyplot as plt
-import seaborn as sns
-import tempfile
-import shutil
 
 import os
 import logging
 from pathlib import Path
 import hashlib
-import pandas as pd
 from typing import List
 import uuid
-import sys
-import io
+
 
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_chroma import Chroma 
@@ -28,21 +19,21 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import (
     TextLoader,
     PyPDFLoader,
-    Docx2txtLoader,  # 🌟 新增：Word 文档加载器
+    Docx2txtLoader,  # 新增：Word 文档加载器
     DirectoryLoader,
 )
 
-# 🌟 纯 LCEL 核心组件 (完全基于 langchain-core)
+# 纯 LCEL 核心组件 (完全基于 langchain-core)
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.chat_history import BaseChatMessageHistory
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.documents import Document
-from langchain_core.tools import tool
 
 
 
-# 🌟 新增：Advanced RAG 核心组件
+
+# 新增：Advanced RAG 核心组件
 from langchain_community.retrievers import BM25Retriever
 from langchain_community.cross_encoders import HuggingFaceCrossEncoder
 # 1. 多查询检索器
@@ -62,8 +53,8 @@ from langchain_community.chat_message_histories import ChatMessageHistory
 from langgraph.checkpoint.memory import MemorySaver
 
 
-# 🌟 联网搜索相关
-# ✅ 换成这个（它返回结构化的 list[dict]）
+# 联网搜索相关
+# 换成这个（它返回结构化的 list[dict]）
 from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
 from langchain_core.documents import Document
 # 🌐 联网搜索 - 多引擎支持
@@ -85,207 +76,10 @@ except ImportError:
     DDG_AVAILABLE = False
 
 
-
-# Agent 相关 (LangGraph 1.0)
-from langchain.agents import create_agent
-from langchain.agents.middleware import ModelCallLimitMiddleware  # 🌟 2. 引入生产级中间件
-
-
 import config
 logger = logging.getLogger(__name__)
 
 
-
-
-# ==========================================
-# 1. 全局工具函数 (Global Tools for Data Agent)
-# ==========================================
-# 用于在 Tool 中引用当前的 DataFrame (全局变量)
-current_df = None
-last_chart_path = None  # 存储最近生成的图表路径
-
-# 创建图表输出目录 (持久化，不会被系统自动清理)
-CHART_OUTPUT_DIR = Path("./chart_outputs")
-CHART_OUTPUT_DIR.mkdir(exist_ok=True)
-
-# 核心：自定义一个带“清洗功能”的安全 Python 工具
-# ==========================================
-@tool
-def safe_python_repl(query: str) -> str:
-    """
-    执行 Python 代码来分析数据。支持多行代码。
-    可用变量: df (当前DataFrame), pd (pandas), np (numpy), plt (matplotlib.pyplot), sns (seaborn)
-    
-    【重要】如果你只是想分析数据、打印统计信息，使用此工具。
-    如果你想画图表，请使用专门的 create_chart 工具（更可靠）。
-    """
-    global current_df, last_chart_path
-    
-    # 1. 清洗大模型生成的错误转义符
-    clean_code = query.replace("\\n", "\n").replace("\\\\", "\\")
-    
-    # 2. 准备安全的执行环境 (注入 df, pd, 以及绘图库)
-    safe_globals = {
-        "df": current_df,
-        "pd": pd,
-        "np": __import__('numpy'),
-        "plt": plt,
-        "sns": sns,
-        "__builtins__": __builtins__,
-    }
-    
-    # 3. 捕获 print 输出
-    old_stdout = sys.stdout
-    sys.stdout = mystdout = io.StringIO()
-    
-    try:
-        # 执行代码前，关闭所有残留的旧图形
-        plt.close('all')
-        
-        # 执行代码
-        exec(clean_code, safe_globals)
-        
-        # 获取 print 输出
-        output = mystdout.getvalue()
-        
-        # 如果没有 print 输出，尝试获取最后一个表达式的值
-        if not output.strip():
-            lines = clean_code.strip().split('\n')
-            if lines:
-                last_line = lines[-1]
-                try:
-                    result = eval(last_line, safe_globals)
-                    if result is not None:
-                        output = str(result)
-                except:
-                    pass
-        
-        # 🌟 核心新增：自动检测是否有未保存的 matplotlib 图形
-        chart_info = ""
-        figs = _auto_save_figures()
-        if figs:
-            last_chart_path = figs[0]  # 取第一张图
-            chart_info = f"\n\n[CHART_SAVED: {last_chart_path}]"
-        
-        result = output[:3000] if len(output) > 3000 else output if output else "代码执行成功，无输出。"
-        return result + chart_info
-        
-    except Exception as e:
-        plt.close('all')  # 出错也必须关闭图形，防止内存泄漏
-        return f"执行出错: {type(e).__name__}: {str(e)}"
-    finally:
-        sys.stdout = old_stdout
-@tool
-def create_chart(code: str) -> str:
-    """
-    🎨 专用绘图工具：执行 Matplotlib/Seaborn 代码并保存图表。
-    
-    当你需要生成可视化图表时，请使用此工具（而不是 safe_python_repl）。
-    
-    Args:
-        code: 完整的 Python 绘图代码。代码中可以直接使用以下变量：
-              - df: 当前加载的 DataFrame
-              - pd: pandas
-              - np: numpy  
-              - plt: matplotlib.pyplot
-              - sns: seaborn
-    
-    代码要求：
-    1. 不需要 import 语句（plt, sns, pd, np 已自动导入）
-    2. 不需要调用 plt.savefig()（系统会自动保存）
-    3. 不需要调用 plt.show()（系统会自动处理）
-    4. 建议设置 figsize 让图表更美观
-    5. 标题和标签请使用中文
-    
-    示例代码：
-        fig, ax = plt.subplots(figsize=(10, 6))
-        sns.barplot(data=df, x='类别', y='数值', ax=ax, palette='viridis')
-        ax.set_title('各类别数值对比', fontsize=16, fontweight='bold')
-        ax.set_xlabel('类别', fontsize=12)
-        ax.set_ylabel('数值', fontsize=12)
-        plt.xticks(rotation=45)
-        plt.tight_layout()
-    """
-    global current_df, last_chart_path
-    
-    # 清洗代码
-    clean_code = code.replace("\\n", "\n").replace("\\\\", "\\")
-    
-    # 准备执行环境
-    safe_globals = {
-        "df": current_df,
-        "pd": pd,
-        "np": __import__('numpy'),
-        "plt": plt,
-        "sns": sns,
-        "__builtins__": __builtins__,
-    }
-    
-    try:
-        # 关闭所有残留图形
-        plt.close('all')
-        
-        # 执行绘图代码
-        exec(clean_code, safe_globals)
-        
-        # 🌟 自动保存
-        saved = _auto_save_figures()
-        
-        if saved:
-            last_chart_path = saved[0]
-            return f"✅ 图表已成功生成并保存！路径: {last_chart_path}\n请在回答中告知用户图表已生成。"
-        else:
-            return "⚠️ 代码执行成功，但未检测到任何图形。请确保代码中创建了 figure (例如 plt.subplots() 或 sns.xxx())"
-            
-    except Exception as e:
-        plt.close('all')
-        return f"❌ 绘图代码执行失败: {type(e).__name__}: {str(e)}\n请检查代码语法并重试。"
-
-def _auto_save_figures() -> list[str]:
-    """
-    🌟 自动检测并保存所有打开的 matplotlib 图形
-    
-    原理：
-    - plt.get_fignums() 返回当前所有打开的 figure 编号
-    - 如果代码中创建了 figure 但没有 savefig，我们在这里自动保存
-    - 保存后关闭所有 figure 释放内存
-    
-    返回: 保存的图片路径列表
-    """
-    global last_chart_path
-    
-    saved_paths = []
-    fig_nums = plt.get_fignums()
-    
-    if not fig_nums:
-        return saved_paths
-    
-    import time
-    timestamp = int(time.time() * 1000)  # 毫秒级时间戳，避免文件名冲突
-    
-    for i, num in enumerate(fig_nums):
-        fig = plt.figure(num)
-        
-        # 检查 figure 是否有实际内容 (排除空 figure)
-        if not fig.axes:
-            continue
-        
-        # 自动生成文件名
-        filename = f"chart_{timestamp}_{i}.png"
-        filepath = CHART_OUTPUT_DIR / filename
-        
-        try:
-            fig.savefig(str(filepath), dpi=150, bbox_inches='tight', 
-                       facecolor='white', edgecolor='none')
-            saved_paths.append(str(filepath))
-            logger.info(f"📊 自动保存图表: {filepath}")
-        except Exception as e:
-            logger.warning(f"⚠️ 自动保存图表失败: {e}")
-    
-    # 🌟 关键：关闭所有图形，释放内存
-    plt.close('all')
-    
-    return saved_paths
 
 
 
@@ -360,10 +154,10 @@ class RAGEngine:
 
         
         #  9. CSV 数据分析模块占位
-        self.dataframes = {}  # 存储上传的 CSV: {"filename.csv": pd.DataFrame}
-        self.data_agent = None # 数据分析 Agent
-        # 📊 初始化 matplotlib 中文字体
-        self._setup_matplotlib_chinese()
+        # self.dataframes = {}  # 存储上传的 CSV: {"filename.csv": pd.DataFrame}
+        # self.data_agent = None # 数据分析 Agent
+        # # 📊 初始化 matplotlib 中文字体
+        # self._setup_matplotlib_chinese()
 
 
 
@@ -429,12 +223,12 @@ class RAGEngine:
             # logger.info(f"秘钥: {api_key}")
             try:
                 self.web_search_tool = TavilySearch(
-                    max_results=10,           # 🌟 从 5 改成 10，召回更多结果
-                    search_depth="advanced",  # 🌟 深度搜索，质量更高 (消耗更多 API 额度)
-                    include_answer=True,       # 🌟 让 Tavily 直接生成一个 AI 摘要答案
+                    max_results=10,           # 从 5 改成 10，召回更多结果
+                    search_depth="advanced",  #  深度搜索，质量更高 (消耗更多 API 额度)
+                    include_answer=True,       #  让 Tavily 直接生成一个 AI 摘要答案
                     include_raw_content=False, # 不返回原始网页内容 (节省 Token)
                     include_images=False,      # 不返回图片
-                    # tavily_api_key=api_key,  # 🌟 直接告诉它！不需要绕道环境变量
+                    # tavily_api_key=api_key,  #  直接告诉它！不需要绕道环境变量
                 )
                 logger.info("✅ Tavily 联网搜索引擎初始化成功 🚀")
             except Exception as e:
@@ -524,21 +318,21 @@ class RAGEngine:
         bm25_retriever = BM25Retriever.from_documents(self.all_chunks)
         bm25_retriever.k = 15
         
-        # Step C: 🌟 混合检索 (Ensemble) - 权重可调
+        # Step C:  混合检索 (Ensemble) - 权重可调
         ensemble_retriever = EnsembleRetriever(
             retrievers=[bm25_retriever, vector_retriever],
             weights=[0.4, 0.6]  # 语义占 60%，关键词占 40%
         )
         logger.info("✅ 混合检索器 (BM25 + Vector) 构建完成")
 
-        # Step D: 🌟 查询改写 (Multi-Query)
+        # Step D: 查询改写 (Multi-Query)
         multi_retriever = MultiQueryRetriever.from_llm(
             retriever=ensemble_retriever, 
             llm=self.llm
         )
         logger.info("✅ 多查询改写器构建完成")
 
-        # Step E: 🌟 重排序 (Reranker)
+        # Step E:  重排序 (Reranker)
         if self.cross_encoder:
             compressor = CrossEncoderReranker(model=self.cross_encoder, top_n=config.TOP_K)
             self.advanced_retriever = ContextualCompressionRetriever(
@@ -650,7 +444,7 @@ class RAGEngine:
                 "question": question,
                 "chat_history": history.messages
             })
-            # 3. 🌟 手动保存记忆 (因为 Chain 是纯净的，所以这里存一次刚刚好)
+            # 3. 手动保存记忆 (因为 Chain 是纯净的，所以这里存一次刚刚好)
             history.add_user_message(question)
             history.add_ai_message(answer_text)
             
@@ -670,7 +464,7 @@ class RAGEngine:
 
     def query_stream(self, question: str):
         """
-        🌟 带记忆 + 联网增强的流式问答
+         带记忆 + 联网增强的流式问答
         
         决策流程：
         1. 先判断知识库是否有相关内容
@@ -745,7 +539,7 @@ class RAGEngine:
                         yield "😔 抱歉，知识库和联网搜索均未找到相关内容。请尝试换一种问法。"
                         return
             
-            # 🌟 Step 3: 构建带联网上下文的 Prompt
+            #  Step 3: 构建带联网上下文的 Prompt
             full_context = "\n\n".join(context_parts)
             
             # 使用专门的联网+知识库 Prompt
@@ -761,7 +555,7 @@ class RAGEngine:
                 ("human", "{question}"),
             ])
             
-            # 🌟 Step 4: 构建并执行 Chain
+            #  Step 4: 构建并执行 Chain
             temp_chain = (
                 web_aware_prompt
 
@@ -848,12 +642,12 @@ class RAGEngine:
             return True, []
         
         # 获取 Reranker 最高分
-        # 🌟 关键：检查 Reranker 的相关性得分
+        #  关键：检查 Reranker 的相关性得分
         # Cross-Encoder (bge-reranker) 的输出分数通常在 -10 ~ 10 之间
         # 经过实际测试，阈值设为 0.0 ~ 1.0 之间比较合理
         # 如果你的 Reranker 是 bge-reranker-base，建议阈值 0.0
         top_score = self._get_reranker_score(question, local_docs[0])
-        # 🌟 新增 如果打分失败（返回负数），直接触发联网
+        # 新增 如果打分失败（返回负数），直接触发联网
         if top_score < 0:
             logger.info("🌐 Reranker 打分异常，安全起见触发联网搜索")
             return True, local_docs
@@ -919,7 +713,7 @@ class RAGEngine:
     
     def _tavily_search(self, query: str) -> list[dict]:
         """
-        🌟 Tavily 搜索实现
+         Tavily 搜索实现
         
         Tavily 的核心优势：
         1. include_answer=True 时，会返回一个 AI 生成的摘要答案
@@ -932,7 +726,7 @@ class RAGEngine:
         
         from tavily import TavilyClient
 
-        # 🌟 使用 TavilyClient 直接调用，可以获取 answer
+        #  使用 TavilyClient 直接调用，可以获取 answer
         # client = TavilyClient(api_key=config.TAVILY_API_KEY) # 使用.env文件传入，这里不需要再次传入
         client = TavilyClient()
         response = client.search(
@@ -1542,253 +1336,6 @@ class RAGEngine:
         except:
             return {"状态": "⚠️ 索引状态异常"}
         
-
-
-
-
-
-
-
-    # ===================================================================================
-    # 7. Tab 5: pandas 数据分析agent (Data Insights / CSV Agent)
-    # 包含：CSV/Excel 数据分析 Agent
-    # ====================================================================================
-
-    def load_dataframe(self, file_path: str) -> dict:
-        """
-        加载 CSV 文件到内存，并初始化数据分析 Agent
-        🌟 通用表格数据加载器：支持 CSV (.csv) 和 Excel (.xlsx, .xls)
-        将数据加载到内存，并初始化 Pandas Data Agent
-        """
-        global current_df # 引用全局变量
-        path = Path(file_path)
-        
-        # 🌟 移除或放宽后缀检查，因为 Gradio 临时文件可能没有 .csv 后缀
-        if not path.exists():
-            return {"error": f"文件不存在: 文件路径为:{file_path}"}
-        
-        suffix = path.suffix.lower()
-        if suffix not in [".csv", ".xlsx", ".xls"]:
-            return {"error": "不支持的文件格式，请上传 CSV 或 Excel 文件"}
-        try:
-            # 1. 读取 CSV
-            df = None
-            # 常见的 CSV 编码顺序：UTF-8 (最通用), GBK (中文 Windows Excel 默认), latin1 (兜底，绝对不会报错)
-            encodings_to_try = ['utf-8', 'gbk', 'gb2312', 'latin1'] 
-            
-            for enc in encodings_to_try:
-                try:
-                    if suffix == ".csv":
-                    # 尝试使用当前编码读取
-                        df = pd.read_csv(file_path, encoding=enc)
-                        logger.info(f"✅ 成功使用 '{enc}' 编码读取 CSV: {path.name}")
-                        file_type_desc = f"CSV (编码: {enc})"  # ✅ 加上这一行
-                        break # 读取成功，跳出循环
-                    else:
-                        # 🌟 读取 Excel：默认读取第一个 Sheet (sheet_name=0)
-                        # 如果需要读取特定 Sheet，后续可以扩展参数
-                        df = pd.read_excel(file_path, sheet_name=0)
-                        file_type_desc = f"Excel (Sheet: {df.name if hasattr(df, 'name') else 'Sheet1'})"
-                except UnicodeDecodeError:
-                    # 如果解码失败，继续尝试下一个编码
-                    continue
-                except Exception as e:
-                    # 如果是其他错误（比如根本不是 CSV 格式），直接抛出
-                    logger.error(f"❌ 读取 CSV 时发生非编码错误: {e}")
-                    return {"error": f"文件内容解析失败 (可能不是有效的 CSV 格式): {str(e)}"}
-            
-
-            # 如果所有编码都失败了（理论上 latin1 不会失败，但以防万一）
-            if df is None:
-                return {"error": "无法解析文件编码(确保是：UTF-8 或 GBK,gb2312, latin1)。"}
-
-            # 2. 基础数据清洗 (可选：去除全空的行列)
-            df.dropna(how='all', inplace=True) 
-            df.dropna(axis=1, how='all', inplace=True)
-
-            # 3. 存入内存字典
-            self.dataframes[path.name] = df
-            current_df = df  # 🌟 让 Tool 能够访问最新的 df
-
-            # 🌟 4. 核心改造：使用 LangGraph 构建现代 Agent
-            # 构建系统提示词 (包含数据概览，让 LLM 知道 df 长什么样)
-            rows, cols = df.shape
-            columns_info = ", ".join([f"{col} ({df[col].dtype})" for col in df.columns])
-            df_head = df.head(3).to_string()
-
-
-            # 5. system_prompt 直接接受纯字符串 (不再需要 SystemMessage 包装)
-            # 构建增强版 system_prompt (包含图表工具使用说明)
-            system_prompt_text = (
-                "你是一个专业的数据分析师和数据可视化专家。\n"
-                "你可以使用 Pandas 对提供的 DataFrame (`df`) 进行数据分析，并使用图表工具生成精美的可视化图表。\n"
-                "请使用中文回答。\n\n"
-                
-                "## 你的工具：\n"
-                "1. **safe_python_repl**: 执行 Python 代码进行数据分析、统计计算、数据清洗等\n"
-                "2. **create_chart**: 专门用于生成 Matplotlib/Seaborn 图表\n\n"
-                
-                "## 工作流程：\n"
-                "1. 如果用户要求分析数据：使用 safe_python_repl 执行分析代码\n"
-                "2. 如果用户要求画图：使用 create_chart 工具生成图表\n"
-                "3. 如果需要先分析再画图：先用 safe_python_repl 准备数据，再用 create_chart 画图\n\n"
-                
-                "## 图表规范：\n"
-                "- 始终设置 figsize 保证图表足够大 (建议 10x6 或 12x8)\n"
-                "- 标题使用中文，fontsize=16, fontweight='bold'\n"
-                "- 轴标签使用中文，fontsize=12\n"
-                "- 如果 x 轴标签过长，使用 plt.xticks(rotation=45)\n"
-                "- 始终调用 plt.tight_layout() 防止标签被裁剪\n"
-                "- 使用 sns 的调色板让图表更美观\n\n"
-                
-                "## 【重要代码格式警告】：\n"
-                "当你调用工具执行代码时，必须确保代码中的换行符是真正的换行符，"
-                "绝对不要输出字面量 '\\n' (反斜杠+n)。\n\n"
-                
-                f"当前数据概览:\n"
-                f"- 行数: {rows}, 列数: {cols}\n"
-                f"- 列名及类型: {columns_info}\n"
-                f"- 前3行预览:\n{df_head}"
-            )   
-
-            # 初始化 LangGraph Checkpointer (现在它真的生效了！)
-            if not hasattr(self, 'agent_checkpointer') or self.agent_checkpointer is None:
-                self.agent_checkpointer = MemorySaver()
-
-            #  6. 构建生产级 Agent (引入 Middleware 中间件)
-            self.data_agent = create_agent(
-                model=self.llm,
-                tools=[safe_python_repl, create_chart],  #  两个工具
-                system_prompt=system_prompt_text, # 新版参数：直接传字符串
-                checkpointer=self.agent_checkpointer,
-                middleware=[
-                    # 生产级防护 1：限制最大模型调用次数，彻底杜绝死循环和 Token 爆炸！
-                    # 如果 Agent 陷入“思考->报错->再思考”的死循环，达到 60 次后会强制中断并返回已有结果。
-                    ModelCallLimitMiddleware(run_limit=60),
-                    
-                    # 生产级防护 2 (可选)：如果你希望长对话自动压缩，可以取消下面这行的注释
-                    # SummarizationMiddleware(max_tokens=4000), 
-                ]
-            )
-
-            logger.info("✅ 数据分析 Agent (create_agent + Middleware) 构建完成")
-
-            return {
-                "status": "success",
-                "filename": path.name,
-                "file_type": file_type_desc,
-                "rows": rows,
-                "columns": cols,
-                "columns_info": columns_info,
-                "preview": df.head(3).to_markdown(index=False)
-            }
-        except Exception as e:
-            logger.error(f"❌ 表格数据加载失败: {e}")
-            return {"error": f"解析失败: {str(e)}"}
-        
-
-    def query_data(self, question: str) -> str:
-        """
-        针对 CSV 数据进行提问分析
-        """
-        if not self.data_agent:
-            return "⚠️ 尚未加载数据！请先上传 CSV/Excel 文件。"
-        
-        try:
-            # 调用 Agent 进行分析
-            # 🌟 传入 thread_id (等同于 session_id)
-            config = {"configurable": {"thread_id": self.data_session_id}}
-            # 🌟 修复：create_agent 的输入输出格式
-            response = self.data_agent.invoke(
-                # {"input": question}, 
-                {"messages": [("user", question)]},
-                config=config
-            )
-            # 提取最后一条 AI 消息的内容
-            return response["messages"][-1].content
-            # return response["output"]
-
-        except Exception as e:
-            logger.error(f"❌ 数据分析失败: {e}")
-            return f"分析失败: {str(e)}"
-        
-    def clear_data_memory(self):
-        """清空数据分析记忆 (重置 thread_id)"""
-        self.data_session_id = str(uuid.uuid4())
-        return "✅ 分析记忆已清空！"
-    
-
-    # ================ 数据可视化=============
-    @staticmethod
-    def _setup_matplotlib_chinese():
-        """
-        🌟 配置 Matplotlib 中文字体 (跨平台兼容)
-        关键：必须在 sns.set_theme() 之后设置字体，否则会被 Seaborn 覆盖！
-        """
-        import platform
-        system = platform.system()
-        
-        # ① 先设置 Seaborn 主题（这会重置 matplotlib 的 rcParams）
-        sns.set_theme(style="whitegrid", palette="husl")
-        
-        # ② 然后再设置中文字体（覆盖 Seaborn 的默认字体）
-        if system == "Windows":
-            # Windows 系统：优先使用微软雅黑（比黑体更美观）
-            plt.rcParams['font.sans-serif'] = [
-                'Microsoft YaHei',  # 微软雅黑（Win7+ 自带）
-                'SimHei',           # 黑体（所有 Windows 自带）
-                'SimSun',           # 宋体（备选）
-            ]
-        elif system == "Darwin":  # macOS
-            plt.rcParams['font.sans-serif'] = [
-                'PingFang SC',      # 苹方（macOS 自带）
-                'Heiti SC',         # 黑体-SC
-                'STHeiti',          # 华文黑体
-            ]
-        else:  # Linux
-            plt.rcParams['font.sans-serif'] = [
-                'WenQuanYi Micro Hei',
-                'Noto Sans CJK SC',
-                'DejaVu Sans',
-            ]
-        
-        # ③ 解决负号 '-' 显示为方块的问题
-        plt.rcParams['axes.unicode_minus'] = False
-        
-        # ④ 验证字体是否生效
-        from matplotlib.font_manager import FontManager
-        fm = FontManager()
-        available_fonts = set(f.name for f in fm.ttflist)
-        
-        chosen_font = None
-        for font in plt.rcParams['font.sans-serif']:
-            if font in available_fonts:
-                chosen_font = font
-                break
-        
-        if chosen_font:
-            logger.info(f"✅ Matplotlib 中文字体已配置: 使用 '{chosen_font}' (系统: {system})")
-        else:
-            logger.warning(
-                f"⚠️ 未找到可用的中文字体！当前可用字体数: {len(available_fonts)}。"
-                f"图表中的中文可能显示为方块。"
-            )
-
-    # 
-    def get_last_chart(self) -> str | None:
-        """获取最近生成的图表路径"""
-        global last_chart_path
-        if last_chart_path and Path(last_chart_path).exists():
-            return last_chart_path
-        return None
-    
-    def clear_last_chart(self):
-        """清空最近生成的图表"""
-        global last_chart_path
-        last_chart_path = None
-
-
-
 
 
 
